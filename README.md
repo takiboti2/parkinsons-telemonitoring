@@ -1,0 +1,129 @@
+# Parkinson's Telemonitoring
+
+## Pinned dependency environments
+
+The application targets Python **3.13** (`>=3.13,<3.14`). All direct application and
+development dependencies use exact versions in `pyproject.toml`; `uv.lock` also pins
+transitive dependencies. `requirements.txt` is the generated export, including
+development tools. Use `uv sync --frozen` to reproduce the environment.
+
+Key application versions:
+
+| Component | Version |
+| --- | --- |
+| MLflow | 3.18.0 |
+| scikit-learn | 1.9.1 |
+| NumPy / SciPy | 2.5.4 / 1.18.1 |
+| pandas | 2.3.3 |
+| FastAPI / Uvicorn | 0.162.7 / 0.54.0 |
+| Pydantic | 2.14.3 |
+| DVC / S3 plugin | 3.67.1 / 3.3.0 |
+| Evidently | 0.7.23 |
+| Streamlit | 1.67.0 |
+| SQLAlchemy | 2.1.8 |
+| Psycopg / psycopg2-binary | 3.3.9 / 2.9.13 |
+| boto3 | 1.43.117 |
+
+Compatibility constraints:
+
+- Keep pandas at 2.3.3: Evidently 0.7.23 fails to import with pandas 3.1.1 because
+  it references removed pandas internals. Dependency resolution alone did not catch this.
+- boto3 is aligned with the botocore version required by DVC's S3 dependencies.
+- DVC's `antlr4-python3-runtime` dependency builds from source. Its build was verified;
+  a blanket wheels-only installation is not supported by this stack.
+- MLflow 3.18.0 uses skops serialization. The compatibility test explicitly trusts
+  `numpy.dtype` and `sklearn.tree._tree.Tree` for its locally trained random forest.
+  Never automatically trust all types found in an external model artifact.
+
+### Optional Airflow environment
+
+Airflow **3.4.0** has an independent dependency set in
+`docker/airflow/requirements.txt`. Do not install it into the application environment:
+its upstream constraints pin different versions of shared packages. Orchestration
+should communicate with the application through its API.
+
+The input file uses Airflow's official Python 3.13 constraints. Regenerate its fully
+pinned Linux x86-64 requirements with:
+
+```bash
+uv pip compile docker/airflow/requirements.in --python-version 3.13 \
+  --python-platform x86_64-manylinux_2_28 --only-binary :all: \
+  --output-file docker/airflow/requirements.txt
+```
+
+For an isolated local installation:
+
+```bash
+uv venv --python 3.13 .venv-airflow
+uv pip install --python .venv-airflow/bin/python -r docker/airflow/requirements.txt
+uv pip check --python .venv-airflow/bin/python
+```
+
+### Compatibility validation
+
+Run the application checks with:
+
+```bash
+uv sync --frozen
+uv pip check --python .venv/bin/python
+uv run pytest tests/test_dependency_compatibility.py \
+  --cov=tests --cov-report=term-missing --cov-fail-under=95
+```
+
+Validated on CPython **3.13.9**, Linux x86-64:
+
+- All 14 dependency smoke tests passed, with 100% coverage of the compatibility test module.
+- scikit-learn preprocessing, fitting, and prediction; MLflow tracking, artifact
+  logging, registration, alias resolution, and model reload passed.
+- Evidently HTML reporting, FastAPI request validation, dependency imports, and
+  DVC/Streamlit CLI startup passed.
+- Both environments passed `uv pip check`; the isolated Airflow environment also
+  passed SDK/provider imports and DAG construction.
+
+These checks do not validate deployed PostgreSQL/S3 connectivity, running dashboards,
+an Airflow scheduler, or a Compose deployment. Dependencies emit upstream deprecation
+warnings, including Evidently's use of NumPy internals, Litestar dependency APIs,
+SQLAlchemy's `noload` strategy, and Starlette's HTTPX test-client support. The warnings
+remain visible; rerun the tests when changing any pins.
+
+## Development checks
+
+Use Python 3.13 and install [uv](https://docs.astral.sh/uv/getting-started/installation/).
+From the repository root, install the locked development dependencies and Git hooks:
+
+```bash
+uv sync --frozen
+uv run pre-commit install
+```
+
+Hooks run automatically on staged files during `git commit`. Run them manually across
+all tracked files with:
+
+```bash
+uv run pre-commit run --all-files
+```
+
+The checks include:
+
+- Black formatting and Flake8 linting, with a 120-character line limit.
+- Strict Pyright checking of the entire `src/` tree when source Python files change.
+- Trailing whitespace, final newlines, YAML/TOML/JSON syntax, and merge conflict markers.
+- Files larger than 1 MiB, to help keep datasets and model artifacts out of Git.
+- Private key detection. This is not a comprehensive secret scanner; never commit credentials.
+
+All hooks use the development tools pinned in `uv.lock`. uv must be on `PATH`, including
+when committing through an editor. Each clone needs its own `pre-commit install`.
+After a hook fixes files, review and stage the changes before committing again.
+
+The default `--all-files` command checks tracked files, not untracked files. Stage new
+files before using it, or check specific files with `uv run pre-commit run --files PATH`.
+
+Full tests, coverage enforcement, and Docker builds belong in CI rather than the
+commit hook. CI should also run `uv run pre-commit run --all-files`, because local
+hooks can be bypassed.
+
+Regenerate the pinned dependency export after changing dependencies:
+
+```bash
+uv export --frozen --all-groups --no-hashes --no-emit-project --output-file requirements.txt
+```

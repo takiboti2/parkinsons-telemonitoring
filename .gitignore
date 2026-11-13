@@ -1,0 +1,24 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+.env
+# Virtual environments
+.venv
+.venv-airflow/
+
+# Keep data payloads out of Git, but allow directories and DVC metadata.
+/data/**
+!/data/**/
+!/data/**/*.dvc
+!/data/**/.gitignore
+
+# Test and coverage outputs
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/

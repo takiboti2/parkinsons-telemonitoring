@@ -1,0 +1,51 @@
+[project]
+name = "parkinsons-telemonitoring"
+version = "0.1.0"
+description = "Reproducible Parkinson's motor UPDRS prediction with experiment tracking and drift monitoring"
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+dependencies = [
+    "boto3==1.43.117",
+    "dvc[s3]==3.67.1",
+    "dvc-s3==3.3.0",
+    "evidently==0.7.23",
+    "fastapi==0.162.7",
+    "httpx==0.28.1",
+    "mlflow==3.18.0",
+    "numpy==2.5.4",
+    # Evidently 0.7.23 imports pandas internals removed in pandas 3.
+    "pandas==2.3.3",
+    "psycopg[binary]==3.3.9",
+    "psycopg2-binary==2.9.13",
+    "pydantic==2.14.3",
+    "pydantic-settings==2.16.3",
+    "scikit-learn==1.9.1",
+    "scipy==1.18.1",
+    "sqlalchemy==2.1.8",
+    "streamlit==1.67.0",
+    "uvicorn[standard]==0.54.0",
+]
+
+[dependency-groups]
+dev = [
+    "black==26.10.1",
+    "coverage==7.17.3",
+    "flake8==7.5.0",
+    "pre-commit==4.7.0",
+    "pre-commit-hooks==6.0.0",
+    "pyright==1.1.414",
+    "pytest==9.2.0",
+    "pytest-cov==7.1.0",
+]
+
+[tool.black]
+line-length = 120
+target-version = ["py313"]
+
+[tool.pyright]
+include = ["src"]
+typeCheckingMode = "strict"
+reportMissingTypeStubs = false
+reportUnknownMemberType = false
+reportUnknownArgumentType = false
+reportUnknownVariableType = false

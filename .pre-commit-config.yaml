@@ -1,0 +1,74 @@
+minimum_pre_commit_version: "4.7.0"
+
+# Resolve every hook through uv.lock instead of creating separate hook environments.
+repos:
+  - repo: local
+    hooks:
+      - id: black
+        name: Format Python with Black
+        entry: uv run --frozen black
+        language: system
+        types_or: [python, pyi]
+
+      - id: flake8
+        name: Lint Python with Flake8
+        entry: uv run --frozen flake8
+        language: system
+        types: [python]
+
+      - id: pyright
+        name: Type-check all source code with Pyright
+        entry: uv run --frozen pyright
+        language: system
+        files: ^src/.*\.pyi?$
+        pass_filenames: false
+
+      - id: trailing-whitespace
+        name: Remove trailing whitespace
+        entry: uv run --frozen python -m pre_commit_hooks.trailing_whitespace_fixer
+        language: system
+        types: [text]
+        args: [--markdown-linebreak-ext=md]
+
+      - id: end-of-file-fixer
+        name: Ensure a final newline
+        entry: uv run --frozen python -m pre_commit_hooks.end_of_file_fixer
+        language: system
+        types: [text]
+
+      - id: check-yaml
+        name: Validate YAML
+        entry: uv run --frozen python -m pre_commit_hooks.check_yaml
+        language: system
+        types: [yaml]
+
+      - id: check-toml
+        name: Validate TOML
+        entry: uv run --frozen python -m pre_commit_hooks.check_toml
+        language: system
+        types: [toml]
+
+      - id: check-json
+        name: Validate JSON
+        entry: uv run --frozen python -m pre_commit_hooks.check_json
+        language: system
+        types: [json]
+
+      - id: check-merge-conflict
+        name: Detect merge conflict markers
+        entry: uv run --frozen python -m pre_commit_hooks.check_merge_conflict
+        language: system
+        types: [text]
+        args: [--assume-in-merge]
+
+      - id: check-added-large-files
+        name: Reject files larger than 1 MiB
+        entry: uv run --frozen python -m pre_commit_hooks.check_added_large_files
+        language: system
+        args: [--maxkb=1024, --enforce-all]
+
+      - id: detect-private-key
+        name: Detect private keys
+        entry: uv run --frozen python -m pre_commit_hooks.detect_private_key
+        language: system
+        types: [text]
