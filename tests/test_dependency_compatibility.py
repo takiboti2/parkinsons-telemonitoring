@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 
 import mlflow
-import mlflow.sklearn
 import numpy as np
 import pandas as pd
 import pytest
@@ -14,9 +13,10 @@ from evidently import Report
 from evidently.presets import DataDriftPreset
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from mlflow.sklearn import load_model, log_model
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
-from sklearn.pipeline import make_pipeline
+from sklearn.pipeline import Pipeline, make_pipeline
 
 
 @pytest.mark.parametrize(
@@ -54,7 +54,7 @@ def test_mlflow_model_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
         mlflow.log_param("random_state", 42)
         mlflow.log_metric("mae", float(np.mean(np.abs(expected - target))))
         mlflow.log_dict({"status": "ok"}, "compatibility.json")
-        info = mlflow.sklearn.log_model(
+        info = log_model(
             pipeline,
             name="pipeline",
             input_example=features,
@@ -65,7 +65,8 @@ def test_mlflow_model_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     version = mlflow.register_model(info.model_uri, "compatibility-model")
     client = mlflow.MlflowClient()
     client.set_registered_model_alias("compatibility-model", "champion", version.version)
-    loaded = mlflow.sklearn.load_model("models:/compatibility-model@champion")
+    loaded = load_model("models:/compatibility-model@champion")
+    assert isinstance(loaded, Pipeline)
     np.testing.assert_allclose(loaded.predict(features), expected)
     assert client.get_run(run.info.run_id).data.params["random_state"] == "42"
     assert client.list_artifacts(run.info.run_id)[0].path == "compatibility.json"
