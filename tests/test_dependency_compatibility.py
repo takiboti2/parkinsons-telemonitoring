@@ -2,10 +2,12 @@
 
 import importlib
 import json
+import os
 import sqlite3
 import subprocess
 import sys
-from contextlib import closing
+from collections.abc import Generator, Iterator
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import mlflow
@@ -17,6 +19,7 @@ from evidently.presets import DataDriftPreset
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from mlflow.sklearn import load_model, log_model
+from mlflow.utils.thread_utils import ThreadLocalVariable
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
 from sklearn.pipeline import Pipeline, make_pipeline
@@ -38,11 +41,85 @@ def test_runtime_imports(module: str) -> None:
     assert importlib.import_module(module) is not None
 
 
-def test_mlflow_model_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Train, track, register, reload, and predict with the pinned ML stack."""
-    monkeypatch.chdir(tmp_path)
-    mlflow.set_tracking_uri(f"sqlite:///{tmp_path / 'tracking.db'}")
-    mlflow.set_experiment("dependency-compatibility")
+@contextmanager
+def _isolated_mlflow_context(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Generator[str]:
+    """Restore MLflow configuration even if a test fails or leaves a run open."""
+    previous_tracking_uri = mlflow.get_tracking_uri()
+    previous_registry_uri = mlflow.get_registry_uri()
+    assert mlflow.active_run() is None
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    uri = f"sqlite:///{tmp_path / 'tracking.db'}"
+    with monkeypatch.context() as isolated:
+        isolated.chdir(tmp_path)
+        # Snapshot the pinned MLflow version's overrides, including an unset value.
+        # Restoring only public getters would turn URI fallback into an explicit URI.
+        isolated.setattr("mlflow.tracking._tracking_service.utils._tracking_uri", uri)
+        isolated.setattr("mlflow.tracking._model_registry.utils._registry_uri", uri)
+        isolated.setattr("mlflow.tracking.fluent._active_experiment_id", None)
+        # end_run() writes this thread-local state; restore the original object
+        # rather than leaving a temporary run ID attached to the old backend.
+        isolated.setattr("mlflow.tracking.fluent._last_active_run_id", ThreadLocalVariable(lambda: None))
+        isolated.setenv("MLFLOW_TRACKING_URI", uri)
+        isolated.setenv("MLFLOW_REGISTRY_URI", uri)
+        isolated.delenv("MLFLOW_EXPERIMENT_ID", raising=False)
+        isolated.delenv("MLFLOW_EXPERIMENT_NAME", raising=False)
+        isolated.delenv("MLFLOW_RUN_ID", raising=False)
+        experiment_id = mlflow.create_experiment("dependency-compatibility")
+        try:
+            yield experiment_id
+        finally:
+            mlflow.end_run()
+    assert mlflow.get_tracking_uri() == previous_tracking_uri
+    assert mlflow.get_registry_uri() == previous_registry_uri
+    assert mlflow.active_run() is None
+
+
+@pytest.fixture
+def isolated_mlflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
+    """Provide an experiment with fully scoped MLflow run/configuration state."""
+    with _isolated_mlflow_context(tmp_path, monkeypatch) as experiment_id:
+        yield experiment_id
+
+
+@pytest.mark.parametrize("fail", [False, True], ids=["success", "exception"])
+def test_mlflow_context_restores_run_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fail: bool) -> None:
+    """Preserve an inherited run ID and prior last run through either exit path."""
+    with _isolated_mlflow_context(tmp_path / "original", monkeypatch) as experiment_id:
+        with mlflow.start_run(experiment_id=experiment_id) as previous_run:
+            previous_id = previous_run.info.run_id
+        previous_uri = mlflow.get_tracking_uri()
+
+        with monkeypatch.context() as inherited:
+            inherited.setenv("MLFLOW_RUN_ID", previous_id)
+
+            def exercise_context() -> None:
+                with _isolated_mlflow_context(tmp_path / "isolated", inherited) as temporary_experiment:
+                    assert "MLFLOW_RUN_ID" not in os.environ
+                    assert mlflow.last_active_run() is None
+                    temporary_run = mlflow.start_run(experiment_id=temporary_experiment)
+                    assert temporary_run.info.run_id != previous_id
+                    if fail:
+                        # Leave this run open to exercise exception-path cleanup.
+                        raise RuntimeError("simulated test failure")
+                    mlflow.end_run()
+
+            if fail:
+                with pytest.raises(RuntimeError, match="simulated test failure"):
+                    exercise_context()
+            else:
+                exercise_context()
+
+            assert os.environ["MLFLOW_RUN_ID"] == previous_id
+            assert mlflow.get_tracking_uri() == previous_uri
+            assert mlflow.get_registry_uri() == previous_uri
+            assert mlflow.active_run() is None
+            restored_run = mlflow.last_active_run()
+            assert restored_run is not None
+            assert restored_run.info.run_id == previous_id
+
+
+def test_mlflow_model_round_trip(isolated_mlflow: str) -> None:
+    """Validate a registered version before promoting and reloading its alias."""
     features = pd.DataFrame({"voice": [0.1, np.nan, 0.3, 0.4], "age": [60.0, 62.0, 64.0, 66.0]})
     target = np.array([10.0, 12.0, 14.0, 16.0])
     pipeline = make_pipeline(SimpleImputer(), RandomForestRegressor(n_estimators=2, random_state=42))
@@ -50,7 +127,7 @@ def test_mlflow_model_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     expected = pipeline.predict(features)
     assert np.isfinite(expected).all()
 
-    with mlflow.start_run() as run:
+    with mlflow.start_run(experiment_id=isolated_mlflow) as run:
         mlflow.log_param("random_state", 42)
         mlflow.log_metric("mae", float(np.mean(np.abs(expected - target))))
         mlflow.log_dict({"status": "ok"}, "compatibility.json")
@@ -64,6 +141,9 @@ def test_mlflow_model_round_trip(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 
     version = mlflow.register_model(info.model_uri, "compatibility-model")
     client = mlflow.MlflowClient()
+    candidate = load_model(f"models:/compatibility-model/{version.version}")
+    assert isinstance(candidate, Pipeline)
+    np.testing.assert_allclose(candidate.predict(features), expected)
     client.set_registered_model_alias("compatibility-model", "champion", version.version)
     loaded = load_model("models:/compatibility-model@champion")
     assert isinstance(loaded, Pipeline)

@@ -23,5 +23,5 @@ wheels/
 coverage.xml
 htmlcov/
 
-#directory of agent-generated reports
-/documents/reports
+# Keep the implementation plan versioned; exclude disposable generated reports.
+/documents/reports/

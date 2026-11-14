@@ -28,7 +28,7 @@ This system is not a clinical diagnostic service. Feature drift alone must not b
 | --- | --- | --- |
 | Git | Repository initialized | Feature-branch workflow, reviews where applicable, remote protections |
 | Dependencies | Exact application/development pins, `uv.lock`, exported `requirements.txt` | Preserve consistency as functionality is added |
-| Local quality checks | Installed pre-commit hooks; Black, Flake8, strict Pyright configuration | Apply gates continuously to new source code |
+| Local quality checks | Installed hooks; Black/Flake8/Pyright; central pytest coverage over `src` and tests | Apply gates continuously to new source code |
 | Compatibility tests | Dependency smoke suite includes SQLite audit persistence and filesystem DVC recovery | Application, integration, failure-path, and deployment tests |
 | Raw dataset | Available at `data/raw/parkinsons_updrs.csv` | DVC initialization, provenance, validation, and preprocessing |
 | Application | No Python implementation in `src/` yet | Packaging, modeling, API, tracking, and monitoring |
@@ -181,9 +181,10 @@ Provide a reproducible training entry point and an MLflow Project definition whe
 2. Train and evaluate candidates on development data.
 3. Evaluate the current champion comparably; do not compare unrelated historical scores.
 4. Reject invalid data, non-finite predictions, failed evaluation, missing artifacts, or unacceptable validation degradation.
-5. Register valid candidates; update the `champion` alias only when acceptance checks pass.
-6. Load and smoke-test the candidate before swapping the API's active model.
-7. Retain previous registry versions and an auditable rollback procedure.
+5. Register valid candidates without changing `champion`.
+6. Load the candidate by immutable registry version and smoke-test its schema and predictions. Failure leaves the alias and active model unchanged.
+7. Under the promotion guard, capture the previous alias/active pipeline, update `champion`, and activate the already-validated pipeline. If activation fails, restore both and record the rollback.
+8. Retain previous registry versions and reconcile alias/active-model state after a crash or interrupted promotion; the alias and in-memory swap are not one database transaction.
 
 Use one API worker/replica and guard competing training/promotion operations within that process. Bootstrap and optional scheduled jobs must not introduce concurrent promotion writers; Airflow should call the API. Before adding API processes or replicas, redesign locking and reassess the SQLite storage choice.
 
@@ -274,6 +275,10 @@ Airflow remains optional and outside plain `docker compose up`. If implemented, 
 
 Keep Streamlit/Airflow adapters thin and their logic covered in `src/`. Coverage omissions and suppression comments require explicit local justification; do not use them to hide untested behavior.
 
+Pytest discovery, measured sources (`src` and `tests`), and the 95% threshold are configured centrally in `pyproject.toml`. Run `uv run --frozen pytest`; avoid `--cov=tests`, which would narrow measurement and leave future application code out of the gate. Both `.venv` and `.venv-airflow` are excluded from root-level Flake8 discovery.
+
+MLflow tests must isolate tracking/registry overrides, environment variables, experiment selection, and active runs. Fixture cleanup must restore previous state even if the test fails. Narrow test-only patches to the pinned MLflow version's internal overrides are documented in the fixture and must be reviewed during dependency upgrades. Compatibility tests validate a version before assigning the champion alias; production activation and rollback remain future application work.
+
 Local pre-commit hooks provide fast formatting, linting, source typing, file hygiene, configuration validation, large-file checks, and private-key detection. The existing private-key check is not a comprehensive secret scanner.
 
 GitHub Actions must explicitly run the hooks, full tests, coverage, image builds, and Compose API smoke tests. Upload reports and logs as CI artifacts. Configure required checks and branch protection where permissions permit.
@@ -284,7 +289,7 @@ Use meaningful incremental commits, at least two preserved feature branches, and
 
 | Phase | Deliverables | Completion criterion |
 | --- | --- | --- |
-| 1. Foundation | Installable package, central pytest/coverage configuration, basic quality CI | Frozen install, hooks, tests, typing, and coverage checks reproducible |
+| 1. Foundation | Complete packaging and basic CI; maintain central pytest/coverage configuration | Frozen install, hooks, tests, typing, and coverage checks reproducible |
 | 2. Data | Filesystem DVC remote, provenance, validation, grouped splits, processed export | Data recoverable with empty cache; stages reproducible; no patient leakage |
 | 3. Modeling | Baseline/candidate pipeline, MLflow runs, registry | Artifacts complete; model reload preserves predictions |
 | 4. API | Training/prediction contracts, authentication, SQLite audit logging | Success, validation, lock/timeout, and dependency-failure paths tested |
@@ -299,6 +304,8 @@ Implement tests alongside each phase rather than postponing them to the end. Add
 ## 12. Operational evidence and documentation
 
 Keep operational instructions in `README.md`; this document describes implementation intent. Document architecture, data provenance, leakage controls, configuration, startup, endpoints, reproduction, monitoring, promotion, rollback, security limitations, known debt, and AI assistance.
+
+Commit `documents/implementation-plan.md` as versioned technical documentation. Ignore only disposable agent-generated reports under `documents/reports/`, not the entire documents directory. Keep this plan, `AGENTS.md`, and README synchronized as decisions change.
 
 Capture genuine screenshots under `screenshots/` showing:
 

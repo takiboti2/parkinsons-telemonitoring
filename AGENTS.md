@@ -74,11 +74,13 @@ Adapt this layout to existing code rather than replacing established structures 
 - For training runs, log parameters, seeds, dependencies, feature schema, Git revision, DVC dataset identity, split metadata, metrics, evaluation reports, and promotion decisions.
 - Save the complete inference pipeline with its input example and model signature.
 - Use a registry alias such as `champion` for the deployed version and retain earlier versions for rollback.
+- Register and load a candidate by its immutable version, then smoke-test its schema and predictions before changing `champion`. Under the promotion guard, capture the previous alias/active model, update the alias, and activate the preloaded pipeline. Roll back both on activation failure; record the outcome and reconcile registry/active-model state after interrupted promotion.
 - Track and package pipelines with MLflow. MLflow is not a general workflow scheduler: use DVC for data stages and optionally Airflow for orchestration. Provide an MLflow Project training entry point where appropriate.
 - Compare candidates against the champion using comparable development validation data and a versioned acceptance policy.
 - Reject candidates with invalid data, non-finite predictions, failed evaluation, incomplete required artifacts, or unacceptable validation degradation.
 - Never use the held-out test set for automatic tuning or promotion.
-- Load and validate a promoted model before replacing the active API model.
+- Activate the exact prevalidated immutable model version; do not resolve a mutable alias again between validation and activation.
+- A rejected or unloadable candidate must never change the champion alias or active model. Test failed validation, failed activation, and rollback paths when implementing promotion.
 - Drift may trigger investigation or candidate training, not unconditional promotion. Retraining requires suitable labeled data.
 
 ## FastAPI requirements
@@ -136,6 +138,8 @@ Run one API worker and one API replica in the default local deployment. Keep tra
 
 - Use pytest and **coverage**. Enforce at least **95% Python test coverage** across all Python code in `src/` **and the Python test code itself**.
 - Configure measurement to include test modules; unexecuted test code is also a defect.
+- Keep pytest discovery, coverage sources (`src` and `tests`), and the 95% threshold in `pyproject.toml`. `uv run --frozen pytest` must enforce coverage by default; do not document a tests-only coverage override as the full quality gate.
+- Isolate MLflow test configuration, including tracking/registry URI overrides, experiment selection, environment variables, and active runs. Use teardown that restores prior state even on test failure; avoid leaking temporary database paths into subsequent tests. Any test-only patches to pinned MLflow internals must be narrowly documented and reviewed on dependency upgrades.
 - Streamlit and Airflow adapters may remain thin, but their business logic belongs in covered `src/` code.
 - Do not game coverage with exclusions. `# pragma: no cover` or coverage omissions require an explicit adjacent justification; for configuration omissions, place the explanation beside the configuration.
 - Aim for zero Flake8 violations, with an upper limit of 1% of all Python lines; `noqa` requires an adjacent justification.
@@ -157,6 +161,7 @@ reportUnknownVariableType = false
 - Include local SQLite audit round trips, lock/timeout behavior, filesystem DVC push/pull with an empty cache, and MLflow SQLite metadata plus local artifact persistence. Test MLflow's HTTP artifact access separately from filesystem-only compatibility checks.
 - Include a clean-start Compose smoke test exercising readiness, training, prediction, and required artifacts.
 - Maintain a passing Docker build and check lockfile/requirements consistency.
+- Exclude both `.venv` and `.venv-airflow` from root-level Flake8 discovery; virtual-environment contents are not project source.
 
 ## Pre-commit and CI
 
@@ -198,6 +203,8 @@ Keep project documentation in **README.md**, including:
 - Configuration, secrets, persistence, and known limitations or technical debt.
 - A short description of AI assistance and how it was used.
 - Links to actual screenshots committed under `screenshots/`.
+
+Version the technical implementation plan at `documents/implementation-plan.md` alongside code and keep it consistent with these instructions and README. Only disposable generated reports under `documents/reports/` are ignored; do not exclude the entire documents directory.
 
 Capture genuine screenshots of:
 

@@ -94,13 +94,12 @@ Run the application checks with:
 ```bash
 uv sync --frozen
 uv pip check --python .venv/bin/python
-uv run pytest tests/test_dependency_compatibility.py \
-  --cov=tests --cov-report=term-missing --cov-fail-under=95
+uv run --frozen pytest
 ```
 
 Validated on CPython **3.13.9**, Linux x86-64:
 
-- All 13 dependency smoke tests passed, with 100% coverage of the compatibility test module.
+- All 15 dependency smoke and isolation regression tests passed, with 100% coverage of the compatibility test module.
 - scikit-learn preprocessing, fitting, and prediction; MLflow tracking, artifact
   logging, registration, alias resolution, and model reload passed.
 - Evidently HTML reporting, FastAPI request validation, dependency imports, and
@@ -115,6 +114,18 @@ an Airflow scheduler, or a Compose deployment. Dependencies emit upstream deprec
 warnings, including Evidently's use of NumPy internals, Litestar dependency APIs,
 SQLAlchemy's `noload` strategy, and Starlette's HTTPX test-client support. The warnings
 remain visible; rerun the tests when changing any pins.
+
+Pytest discovery and coverage are configured in `pyproject.toml`. The default test
+command measures both `src/` and test code and fails below 95%. The current coverage
+result covers the compatibility tests only because application source is not yet
+implemented. Do not narrow the quality gate with `--cov=tests` when adding source code.
+
+MLflow tests use an isolated fixture that restores URI overrides, experiment
+selection, environment variables (including inherited `MLFLOW_RUN_ID`), active runs,
+and the previous last-active-run reference. Regression tests cover successful and
+exceptional exits. They validate a registered
+version before changing its champion alias; application promotion/activation rollback
+will be implemented separately.
 
 ## Development checks
 
@@ -141,6 +152,8 @@ The checks include:
 - Files larger than 1 MiB, to help keep datasets and model artifacts out of Git.
 - Private key detection. This is not a comprehensive secret scanner; never commit credentials.
 
+Root-level Flake8 checks exclude both `.venv` and `.venv-airflow`.
+
 All hooks use the development tools pinned in `uv.lock`. uv must be on `PATH`, including
 when committing through an editor. Each clone needs its own `pre-commit install`.
 After a hook fixes files, review and stage the changes before committing again.
@@ -157,3 +170,9 @@ Regenerate the pinned dependency export after changing dependencies:
 ```bash
 uv export --frozen --all-groups --no-hashes --no-emit-project --output-file requirements.txt
 ```
+
+## Technical plan
+
+The versioned [implementation plan](documents/implementation-plan.md) describes the
+remaining work and acceptance criteria. `AGENTS.md` holds repository-wide development
+instructions. Only disposable generated reports under `documents/reports/` are ignored.
