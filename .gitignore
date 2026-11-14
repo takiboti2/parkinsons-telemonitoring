@@ -10,12 +10,6 @@ wheels/
 .venv
 .venv-airflow/
 
-#dvc remote storage
-storage/
-#dvc local cache
-.dvc/cache
-
-
 # Keep data payloads out of Git, but allow directories and DVC metadata.
 /data/**
 !/data/**/

@@ -7,6 +7,106 @@ their source descriptions and encodings, and their modeling roles. The regressio
 target is `motor_UPDRS`; `total_UPDRS` is excluded and `subject#` is used only for
 grouping and auditing.
 
+## DVC data versioning
+
+DVC is initialized, and the raw dataset is tracked through
+`data/raw/parkinsons_updrs.csv.dvc`. The configured default filesystem remote is
+`localstorage`; the raw dataset has been pushed and verified against the local cache
+and remote. The validation, preparation, and splitting stages are not implemented
+yet, so there is no `dvc.yaml` or `dvc.lock` at this point.
+
+### Local storage configuration
+
+The versioned `.dvc/config` contains:
+
+```ini
+[core]
+    remote = localstorage
+['remote "localstorage"']
+    url = ../../parkinsons-dvc-storage
+```
+
+DVC resolves this URL relative to `.dvc/config`, not the shell's current directory.
+It refers to a sibling of the repository directory:
+
+```text
+/home/default/projects/mlsecops/
+├── parkinsons-telemonitoring/     # Git repository and working dataset
+│   ├── .dvc/cache/                # Disposable local DVC cache
+│   └── data/raw/parkinsons_updrs.csv
+└── parkinsons-dvc-storage/        # Persistent DVC remote
+```
+
+The remote currently resolves to
+`/home/default/projects/mlsecops/parkinsons-dvc-storage`. Moving the repository
+changes the resolved location unless the sibling layout is preserved. This is local
+storage on the same machine, not a cloud service or an independent backup. Back up
+the remote separately; Git alone cannot restore dataset contents.
+
+### Retrieve data after cloning
+
+Install the locked environment, ensure the configured remote directory contains the
+dataset objects and is readable, then run from the repository root:
+
+```bash
+uv sync --frozen
+uv run --frozen dvc pull
+uv run --frozen dvc status
+uv run --frozen dvc status --cloud
+```
+
+Do not rerun `dvc init` in an existing checkout. If the remote is elsewhere, override
+its URL locally before pulling:
+
+```bash
+uv run --frozen dvc remote modify --local localstorage url /absolute/path/to/parkinsons-dvc-storage
+uv run --frozen dvc pull
+```
+
+This override is stored in ignored `.dvc/config.local`, preserving the shared
+configuration. A new machine needs access to a copy/backup of the populated remote,
+or the exact raw dataset from a trusted source. An empty remote cannot recover data.
+Automatic pinned-source download/offline-bundle bootstrap remains planned work.
+
+The current raw dataset identity is:
+
+| Property | Value |
+| --- | --- |
+| File | `data/raw/parkinsons_updrs.csv` |
+| Size | 911,261 bytes |
+| DVC MD5 | `4f97310e2c9fbeedb72e8a37822fee45` |
+
+The checksum identifies the dataset version; it is not a cryptographic authenticity
+guarantee. If restoring the exact file manually, verify its size and MD5 against the
+values above first. Then rebuild the cache from that matching file and populate the
+configured remote:
+
+```bash
+uv run --frozen dvc commit data/raw/parkinsons_updrs.csv.dvc
+uv run --frozen dvc push
+```
+
+Do not force a checksum mismatch or run `dvc add` merely to accept a different
+download as the expected version.
+
+### Intentional dataset updates
+
+Keep the current raw source unchanged during preprocessing; write derived data to
+`data/processed/`. If deliberately replacing the source with a new dataset version:
+
+```bash
+uv run --frozen dvc add data/raw/parkinsons_updrs.csv
+uv run --frozen dvc push
+uv run --frozen dvc status --cloud
+git add data/raw/parkinsons_updrs.csv.dvc
+```
+
+Review the new pointer and provenance before committing. Commit DVC configuration,
+ignore rules, and `.dvc` pointers to Git, never the CSV, `.dvc/cache/`, local override,
+or remote dataset objects. `dvc status` compares the workspace with its pointer/cache;
+`dvc status --cloud` checks cache/remote synchronization. Neither command replaces
+dataset validation or an empty-cache recovery test.
+
 ## Modeling approach
 
 All fitted model experiments use scikit-learn's `LinearRegression` (ordinary least
@@ -32,8 +132,9 @@ required. The API, dashboards, and Compose deployment are not implemented yet.
 
 Use Python's standard-library `sqlite3` for audit storage. Dashboard clients will use
 a read-only API interface rather than sharing database files. MLflow clients will
-not need the artifact directory mounted. The DVC remote must be populated from a
-pinned source or offline bundle; an empty remote is not a dataset bootstrap source.
+not need the artifact directory mounted. The existing DVC remote is populated;
+first-use recovery on another machine requires access to its contents or an exact
+dataset copy as described above. Automated dataset bootstrap is not implemented yet.
 
 This configuration targets local, low-concurrency use. Keep SQLite databases on local
 disks, use short transactions and bounded busy timeouts, and use WAL mode for audit
