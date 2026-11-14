@@ -1,5 +1,12 @@
 # Parkinson's Telemonitoring
 
+## Dataset reference
+
+The [data dictionary](documents/data-dictionary.md) documents all 22 raw columns,
+their source descriptions and encodings, and their modeling roles. The regression
+target is `motor_UPDRS`; `total_UPDRS` is excluded and `subject#` is used only for
+grouping and auditing.
+
 ## Minimal local architecture
 
 The planned default deployment uses FastAPI, MLflow, Streamlit, and an idempotent
