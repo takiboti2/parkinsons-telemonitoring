@@ -27,6 +27,8 @@ dev = [
     "black==26.10.1",
     "coverage==7.17.3",
     "flake8==7.5.0",
+    "nbdime==4.0.4",
+    "nbstripout==0.9.1",
     "pre-commit==4.7.0",
     "pre-commit-hooks==6.0.0",
     "pyright==1.1.414",

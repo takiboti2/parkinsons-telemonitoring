@@ -6,6 +6,13 @@ Build a reproducible, minimal local Parkinson's telemonitoring MLOps system. Pri
 
 Do not claim that checks passed, screenshots were captured, or services ran unless they actually did. Document failures, fixes, limitations, and justified deviations.
 
+## Smallest standard configuration
+
+- Make the smallest change that satisfies the request. Prefer standard tool configuration and existing commands over custom wrappers, scripts, or abstractions.
+- Ask before adding dependencies, workflows, or supporting infrastructure beyond what the request requires. Do not expand scope to anticipate hypothetical future needs.
+- Test application logic and concrete integration risks; do not build custom test suites merely to re-test established third-party tools. Preserve all existing required quality gates.
+- Keep documentation concise: essential setup, usage, and material limitations only.
+
 ## Dataset and modeling
 
 - The raw dataset is `data/raw/parkinsons_updrs.csv`. Keep it in place and preserve the source data; write derived outputs to `data/processed/`.
@@ -182,6 +189,16 @@ uv run pre-commit run --all-files
 - Configure required status checks and branch protection where repository permissions allow; local hooks alone can be bypassed.
 
 ## Git workflow
+
+### Jupyter notebooks
+
+- Track `.ipynb` files directly; ignore `.ipynb_checkpoints/`. Use nbstripout through the uv-managed pre-commit hook and nbdime for notebook-aware local Git diffs/merges.
+- Invoke `uv run --frozen nbstripout` directly from the pre-commit hook. Use its standard behavior, with no custom wrapper, dedicated notebook tooling tests, or notebook workflow. Stripping modifies working copies; `nbstripout --verify` checks without modifying them. Do not use output-retention metadata/tags to bypass the no-output convention.
+- Follow README's per-clone commands to install hooks and register uv-resolved nbdime diff/merge drivers in local `.git/config` only. Do not change global Git configuration or install a competing nbstripout clean/diff filter. Keep direct notebook-tool dependencies limited to pinned `nbstripout` and `nbdime`; notebook execution tools are separate.
+- Keep reusable business logic in covered `src/` modules; notebooks must use only `LinearRegression` for fitted models. Do not embed credentials or private records in source, Markdown, or attachments.
+- Hygiene checks do not execute notebooks or lint/type-check their code cells. Add separate clean-kernel execution checks when analysis notebooks exist, with DVC-provided data and bounded timeouts. Keep the full source/test coverage gate intact.
+
+### Commits and review
 
 - Initialize Git before implementation if it is not initialized already.
 - Make frequent, meaningful commits throughout development. Preserve incremental changes and fixes; do not fabricate history or split changes artificially to inflate commit counts.

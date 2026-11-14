@@ -107,6 +107,16 @@ or remote dataset objects. `dvc status` compares the workspace with its pointer/
 `dvc status --cloud` checks cache/remote synchronization. Neither command replaces
 dataset validation or an empty-cache recovery test.
 
+## Jupyter notebooks in Git
+
+Commit `.ipynb` files; nbstripout clears outputs on commit. Review and restage any
+hook changes. For nbdime diffs and merges, configure each clone once:
+
+```bash
+git config --local diff.jupyternotebook.command 'uv run --frozen git-nbdiffdriver diff'
+git config --local merge.jupyternotebook.driver 'uv run --frozen git-nbmergedriver merge %O %A %B %L %P'
+```
+
 ## Modeling approach
 
 All fitted model experiments use scikit-learn's `LinearRegression` (ordinary least

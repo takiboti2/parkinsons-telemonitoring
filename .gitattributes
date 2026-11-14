@@ -1,0 +1,2 @@
+# Notebook-aware local Git drivers; register them per clone using the setup script.
+*.ipynb diff=jupyternotebook merge=jupyternotebook

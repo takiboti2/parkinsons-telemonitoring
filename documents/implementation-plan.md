@@ -29,6 +29,7 @@ This system is not a clinical diagnostic service. Feature drift alone must not b
 | Git | Repository initialized | Feature-branch workflow, reviews where applicable, remote protections |
 | Dependencies | Exact application/development pins, `uv.lock`, exported `requirements.txt` | Preserve consistency as functionality is added |
 | Local quality checks | Installed hooks; Black/Flake8/Pyright; central pytest coverage over `src` and tests | Apply gates continuously to new source code |
+| Notebook versioning | Direct nbstripout hook, nbdime attributes/local drivers, checkpoint ignores | Add real analysis notebooks; execution tooling/checks are separate |
 | Compatibility tests | Dependency smoke suite includes SQLite audit persistence and filesystem DVC recovery | Application, integration, failure-path, and deployment tests |
 | Raw dataset | Available at `data/raw/parkinsons_updrs.csv` | DVC initialization, provenance, validation, and preprocessing |
 | Application | No Python implementation in `src/` yet | Packaging, modeling, API, tracking, and monitoring |
@@ -107,6 +108,7 @@ tests/
   integration/
   e2e/
 dashboards/              # Thin Streamlit entry point
+notebooks/               # Tracked .ipynb source, stripped outputs; setup documentation
 dags/                    # Optional thin Airflow adapters
 data/raw/                # Source dataset, preserved unchanged
 data/processed/          # Versioned derived outputs
@@ -289,6 +291,8 @@ Pytest discovery, measured sources (`src` and `tests`), and the 95% threshold ar
 MLflow tests must isolate tracking/registry overrides, environment variables, experiment selection, and active runs. Fixture cleanup must restore previous state even if the test fails. Narrow test-only patches to the pinned MLflow version's internal overrides are documented in the fixture and must be reviewed during dependency upgrades. Compatibility tests validate a version before assigning the champion alias; production activation and rollback remain future application work.
 
 Local pre-commit hooks provide fast formatting, linting, source typing, file hygiene, configuration validation, large-file checks, and private-key detection. The existing private-key check is not a comprehensive secret scanner.
+
+Track notebooks directly as `.ipynb` files, ignore checkpoints, and invoke pinned nbstripout directly from pre-commit with its standard behavior. Register uv-managed nbdime diff/merge drivers using README's local Git configuration commands; do not change global configuration. No wrapper scripts, custom notebook tooling tests, or dedicated notebook workflow are required. Do not use nbstripout's output-retention metadata/tags to keep outputs in commits. Keep brief guidance in `notebooks/README.md` and reusable logic in `src/`. Hygiene does not establish notebook execution correctness; execution tools and future clean-kernel checks are separate. The main Python coverage gate is unchanged.
 
 GitHub Actions must explicitly run the hooks, full tests, coverage, image builds, and Compose API smoke tests. Upload reports and logs as CI artifacts. Configure required checks and branch protection where permissions permit.
 
