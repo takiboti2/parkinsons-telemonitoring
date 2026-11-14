@@ -69,7 +69,7 @@ Except where indicated by the source description or column label, the supplied a
 - Preserve the raw CSV unchanged, including original column names and numeric precision.
 - Predict `motor_UPDRS`; exclude `total_UPDRS` to avoid using a related clinical score as an input.
 - Split and cross-validate by `subject#` so the same subject cannot occur in both fitting and evaluation partitions. Remove the identifier before fitting the estimator.
-- Retain `age`, `sex`, `test_time`, and all 16 voice attributes as the initial 19 predictors.
+- The `LinearRegression` baseline uses only `age`, `sex`, and `test_time`. The full-feature `LinearRegression` candidate adds all 16 voice attributes for 19 predictors total.
 - Do not assume repeated subject identifiers or repeated measurements are duplicate errors.
 - Do not infer permissible ranges from names alone, such as requiring nonnegative `test_time` without checking source documentation.
 - Define missing-value handling and schema validation explicitly in the processing pipeline. Fit learned preprocessing only on training partitions.

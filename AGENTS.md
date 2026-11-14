@@ -16,7 +16,8 @@ Do not claim that checks passed, screenshots were captured, or services ran unle
 - Use patient-disjoint train/validation/test partitions because patients have repeated measurements. Use grouped cross-validation on development data; keep the fixed test set out of candidate selection and promotion.
 - Fit imputation and other learned preprocessing only on training data. Package preprocessing and the estimator together in a scikit-learn pipeline for identical training and inference behavior.
 - Validate schema, types, missing targets, missing values, invalid values, and duplicates. Make cleaning decisions explicit and reproducible.
-- Start with a `DummyRegressor` baseline and a random forest regression candidate. Log MAE, RMSE, and R² without promising a particular score.
+- Every fitted model experiment must use scikit-learn's `LinearRegression` (ordinary least squares). Do not use `DummyRegressor`, random forests, Ridge, Lasso, or other estimators, including in compatibility tests.
+- The baseline uses only `age`, `sex`, and `test_time`. The full-feature candidate adds all 16 voice measurements for 19 predictors total. Compare them on identical patient-disjoint splits and grouped cross-validation folds, with training-only imputation inside each pipeline. Log MAE, RMSE, and R² without promising a particular score.
 - Preserve a versioned split manifest, data schema, and preprocessed dataset for reproducibility and export.
 - The system is not a clinical diagnostic service; document that limitation in the API and README.
 

@@ -7,6 +7,16 @@ their source descriptions and encodings, and their modeling roles. The regressio
 target is `motor_UPDRS`; `total_UPDRS` is excluded and `subject#` is used only for
 grouping and auditing.
 
+## Modeling approach
+
+All fitted model experiments use scikit-learn's `LinearRegression` (ordinary least
+squares), including compatibility tests. The baseline uses `age`, `sex`, and
+`test_time`; the full-feature candidate adds all 16 voice measurements. Comparing
+them on identical patient-disjoint splits and grouped validation folds measures
+whether voice features add predictive value. Fit imputation only on each training
+partition, log MAE/RMSE/R² in MLflow, and keep the held-out test set out of model
+selection and promotion. Other estimator families are not part of this design.
+
 ## Minimal local architecture
 
 The planned default deployment uses FastAPI, MLflow, Streamlit, and an idempotent
@@ -62,9 +72,10 @@ Compatibility constraints:
   boto3, and DVC's S3 plugin are not part of the default dependency set.
 - DVC's `antlr4-python3-runtime` dependency builds from source. Its build was verified;
   a blanket wheels-only installation is not supported by this stack.
-- MLflow 3.18.0 uses skops serialization. The compatibility test explicitly trusts
-  `numpy.dtype` and `sklearn.tree._tree.Tree` for its locally trained random forest.
-  Never automatically trust all types found in an external model artifact.
+- MLflow 3.18.0 uses skops serialization. The locally fitted imputation/linear
+  regression compatibility pipeline requires explicitly trusting `numpy.dtype`.
+  No tree types are needed. Review trusted types narrowly; never automatically
+  trust all types found in an external model artifact.
 
 ### Optional Airflow environment
 

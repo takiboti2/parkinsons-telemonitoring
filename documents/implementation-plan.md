@@ -157,7 +157,16 @@ This protocol measures generalization to unseen patients. A future task predicti
 
 ### 5.4 Baseline and candidate evaluation
 
-Start with `DummyRegressor` and a reproducible random forest candidate. Evaluate a bounded configuration set with MAE, RMSE, and R². Select configurations using development data, not the test set.
+Every fitted experiment must use scikit-learn's `LinearRegression` (ordinary least squares), including compatibility tests. Do not fit dummy regressors, random forests, Ridge, Lasso, or other estimator families.
+
+| Experiment | Estimator | Predictors | Purpose |
+| --- | --- | --- | --- |
+| Baseline | `LinearRegression` | `age`, `sex`, `test_time` | Establish predictive value from patient information and elapsed trial time without voice measurements |
+| Full-feature candidate | `LinearRegression` | Baseline features plus all 16 voice measurements | Measure the incremental predictive value of voice features |
+
+Evaluate both on identical patient-disjoint development splits and grouped cross-validation folds using MAE, RMSE, and R². Fit imputation separately within each training fold, using an explicit feature list followed by the estimator in one pipeline. Do not scale, clip, transform, or select features by default; any later preprocessing experiment must remain inside the training pipeline and retain `LinearRegression` as its estimator. Neither experiment may use `subject#` or `total_UPDRS` as predictors. Keep the final test set out of selection and promotion.
+
+Ordinary least squares requires no estimator random seed; preserve split seeds and fold assignments for reproducible comparisons. Log the estimator name and feature-set identity with every run. The baseline is an evaluation reference, not a guaranteed deployment choice: promote only a candidate that passes the common acceptance policy.
 
 The exported preprocessed dataset must be documented separately from learned model transformations: exporting data must not cause preprocessing to be fitted on held-out observations.
 

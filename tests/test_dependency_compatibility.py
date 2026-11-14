@@ -20,8 +20,8 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from mlflow.sklearn import load_model, log_model
 from mlflow.utils.thread_utils import ThreadLocalVariable
-from sklearn.ensemble import RandomForestRegressor
 from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline, make_pipeline
 
 
@@ -120,35 +120,41 @@ def test_mlflow_context_restores_run_state(tmp_path: Path, monkeypatch: pytest.M
 
 def test_mlflow_model_round_trip(isolated_mlflow: str) -> None:
     """Validate a registered version before promoting and reloading its alias."""
-    features = pd.DataFrame({"voice": [0.1, np.nan, 0.3, 0.4], "age": [60.0, 62.0, 64.0, 66.0]})
+    features = pd.DataFrame(
+        {"age": [60.0, 62.0, np.nan, 66.0], "sex": [0.0, 1.0, 0.0, 1.0], "test_time": [0.0, 7.0, 14.0, 21.0]}
+    )
     target = np.array([10.0, 12.0, 14.0, 16.0])
-    pipeline = make_pipeline(SimpleImputer(), RandomForestRegressor(n_estimators=2, random_state=42))
+    pipeline = make_pipeline(SimpleImputer(strategy="median"), LinearRegression())
     pipeline.fit(features, target)
     expected = pipeline.predict(features)
     assert np.isfinite(expected).all()
 
     with mlflow.start_run(experiment_id=isolated_mlflow) as run:
-        mlflow.log_param("random_state", 42)
+        mlflow.log_param("estimator", "LinearRegression")
+        mlflow.log_param("feature_set", "demographics_time")
         mlflow.log_metric("mae", float(np.mean(np.abs(expected - target))))
         mlflow.log_dict({"status": "ok"}, "compatibility.json")
         info = log_model(
             pipeline,
             name="pipeline",
             input_example=features,
-            # Only trust these known types in this locally constructed model.
-            skops_trusted_types=["numpy.dtype", "sklearn.tree._tree.Tree"],
+            # The locally fitted imputer stores a NumPy dtype; no tree types are needed.
+            skops_trusted_types=["numpy.dtype"],
         )
 
     version = mlflow.register_model(info.model_uri, "compatibility-model")
     client = mlflow.MlflowClient()
     candidate = load_model(f"models:/compatibility-model/{version.version}")
     assert isinstance(candidate, Pipeline)
+    assert isinstance(candidate.named_steps["linearregression"], LinearRegression)
     np.testing.assert_allclose(candidate.predict(features), expected)
     client.set_registered_model_alias("compatibility-model", "champion", version.version)
     loaded = load_model("models:/compatibility-model@champion")
     assert isinstance(loaded, Pipeline)
     np.testing.assert_allclose(loaded.predict(features), expected)
-    assert client.get_run(run.info.run_id).data.params["random_state"] == "42"
+    parameters = client.get_run(run.info.run_id).data.params
+    assert parameters["estimator"] == "LinearRegression"
+    assert parameters["feature_set"] == "demographics_time"
     assert client.list_artifacts(run.info.run_id)[0].path == "compatibility.json"
 
 
