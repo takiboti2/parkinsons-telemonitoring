@@ -22,3 +22,6 @@ wheels/
 .coverage.*
 coverage.xml
 htmlcov/
+
+#directory of agent-generated reports
+/documents/reports

@@ -1,8 +1,11 @@
 """Smoke-test the pinned dependency stack without external services."""
 
 import importlib
+import json
+import sqlite3
 import subprocess
 import sys
+from contextlib import closing
 from pathlib import Path
 
 import mlflow
@@ -22,10 +25,7 @@ from sklearn.pipeline import Pipeline, make_pipeline
 @pytest.mark.parametrize(
     "module",
     [
-        "boto3",
-        "dvc_s3",
-        "psycopg",
-        "psycopg2",
+        "sqlite3",
         "pydantic_settings",
         "scipy",
         "sqlalchemy",
@@ -81,6 +81,60 @@ def test_evidently_report(tmp_path: Path) -> None:
     output = tmp_path / "drift.html"
     report.save_html(str(output))
     assert output.stat().st_size > 0
+
+
+def test_sqlite_audit_round_trip(tmp_path: Path) -> None:
+    """Persist and retrieve structured requests and predictions locally."""
+    path = tmp_path / "audit.db"
+    request = {"voice": 0.1, "age": 60.0}
+    predictions = [12.0]
+    with closing(sqlite3.connect(path, timeout=5.0)) as connection, connection:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        connection.execute(
+            "CREATE TABLE audit (request_id TEXT PRIMARY KEY, features TEXT NOT NULL, predictions TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO audit VALUES (?, ?, ?)",
+            ("compatibility-request", json.dumps(request), json.dumps(predictions)),
+        )
+
+    with closing(sqlite3.connect(path, timeout=5.0)) as connection:
+        row = connection.execute(
+            "SELECT features, predictions FROM audit WHERE request_id = ?", ("compatibility-request",)
+        ).fetchone()
+    assert row is not None
+    assert json.loads(row[0]) == request
+    assert json.loads(row[1]) == predictions
+
+
+def test_dvc_filesystem_remote(tmp_path: Path) -> None:
+    """Push data to a local DVC remote and recover it without a cloud plugin."""
+    repository = tmp_path / "repository"
+    repository.mkdir()
+    remote = tmp_path / "remote"
+
+    def dvc(*arguments: str) -> None:
+        subprocess.run(
+            [sys.executable, "-m", "dvc", *arguments],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+
+    dvc("init", "--no-scm")
+    dataset = repository / "sample.csv"
+    dataset.write_text("voice,motor_UPDRS\n0.1,12.0\n", encoding="utf-8")
+    expected = dataset.read_bytes()
+    dvc("add", "sample.csv")
+    dvc("remote", "add", "--default", "local", str(remote))
+    dvc("push")
+    dataset.unlink()
+    # Use a fresh cache so pull must restore from the filesystem remote.
+    dvc("cache", "dir", str(tmp_path / "empty-cache"))
+    dvc("pull")
+    assert dataset.read_bytes() == expected
 
 
 def test_fastapi_prediction_contract() -> None:

@@ -5,9 +5,7 @@ description = "Reproducible Parkinson's motor UPDRS prediction with experiment t
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 dependencies = [
-    "boto3==1.43.117",
-    "dvc[s3]==3.67.1",
-    "dvc-s3==3.3.0",
+    "dvc==3.67.1",
     "evidently==0.7.23",
     "fastapi==0.162.7",
     "httpx==0.28.1",
@@ -15,8 +13,6 @@ dependencies = [
     "numpy==2.5.4",
     # Evidently 0.7.23 imports pandas internals removed in pandas 3.
     "pandas==2.3.3",
-    "psycopg[binary]==3.3.9",
-    "psycopg2-binary==2.9.13",
     "pydantic==2.14.3",
     "pydantic-settings==2.16.3",
     "scikit-learn==1.9.1",

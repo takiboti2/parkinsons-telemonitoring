@@ -2,7 +2,7 @@
 
 ## Purpose and scope
 
-Build a production-ready, reproducible Parkinson's telemonitoring MLOps system. Prioritize reproducible pipelines, observable services, and reliable automation over a fixed model-score target. Automatically improve performance where feasible and prevent potential degradation through validation and guarded model promotion.
+Build a reproducible, minimal local Parkinson's telemonitoring MLOps system. Prioritize reproducible pipelines, observable services, and reliable automation over a fixed model-score target. Automatically improve performance where feasible and prevent potential degradation through validation and guarded model promotion. The default deployment targets one machine and low write concurrency, not distributed production scale.
 
 Do not claim that checks passed, screenshots were captured, or services ran unless they actually did. Document failures, fixes, limitations, and justified deviations.
 
@@ -26,6 +26,7 @@ Do not claim that checks passed, screenshots were captured, or services ran unle
 - Maintain `pyproject.toml` and commit `uv.lock`.
 - Generate and commit `requirements.txt` with exact versions from the lockfile; do not maintain a conflicting dependency list manually.
 - Use frozen dependency resolution in CI and Docker.
+- Use Python's standard-library `sqlite3` for local audit persistence and SQLAlchemy/SQLite for MLflow metadata. Do not add PostgreSQL drivers, S3 plugins, or cloud SDKs to the default dependency set without a concrete requirement.
 - Select and document a Python version compatible with the chosen MLflow, Evidently, and optional Airflow versions.
 - Follow PEP8, use type hints, and configure a maximum line length of **120**.
 - Keep business logic under `src/parkinsons_ml/`. Streamlit and optional Airflow code must be thin adapters to tested business logic in `src/`.
@@ -61,13 +62,15 @@ Adapt this layout to existing code rather than replacing established structures 
 - Use **Git** for code, configuration, documentation, and DVC metadata.
 - Use **DVC** for raw and processed datasets. Do not commit datasets or model binaries directly to Git.
 - Define reproducible validation, preparation, and splitting stages in `dvc.yaml`; commit the corresponding lockfile and metadata.
-- Configure a persistent DVC remote and document access. A clean checkout must not depend on an undocumented local cache.
+- Configure a persistent local filesystem DVC remote and document its host/container paths. Keep it distinct from the working dataset, DVC cache, and MLflow artifacts. A clean checkout must not depend on an undocumented local cache or an already-populated remote.
 - Support an accessible pinned dataset download or a documented offline data bundle for deployment and reproducibility.
+- Do not require MinIO, cloud storage, or DVC's S3 plugin for the default local workflow.
 - Record seeds, dataset identities, split identities, and code revisions for reproducibility.
 
 ## MLflow and model lifecycle
 
 - Use **MLflow Tracking** for experiments and artifacts and **MLflow Model Registry** for model versions.
+- Store metadata and registry state in a persistent SQLite file owned by the MLflow service. Store artifacts on a separate persistent local volume and serve/proxy them through MLflow; clients must not need the artifact filesystem mounted.
 - For training runs, log parameters, seeds, dependencies, feature schema, Git revision, DVC dataset identity, split metadata, metrics, evaluation reports, and promotion decisions.
 - Save the complete inference pipeline with its input example and model signature.
 - Use a registry alias such as `champion` for the deployed version and retain earlier versions for rollback.
@@ -89,11 +92,14 @@ Provide a REST API with interactive Swagger documentation and these endpoints:
 
 For the initial small dataset, synchronous training is acceptable with a one-training-job-at-a-time guard. Add a durable job queue only if needed; do not run critical jobs as untracked in-process background tasks.
 
+Run one API worker and one API replica in the default local deployment. Keep training and promotion within that single writer's guarded workflow. Revisit locking and storage before adding processes or replicas.
+
 - Accept only approved dataset versions and bounded configuration, not arbitrary paths or executable input.
 - Protect training with authentication and keep secrets out of source control and logs.
 - Save artifacts with MLflow for **both training and prediction**.
 - Initially, use one MLflow inference run per request batch, storing validated inputs, predictions, timestamps, schema version, model identity, and latency.
 - Persist structured incoming-request and prediction records suitable for Evidently reports.
+- Use a separate persistent SQLite audit database, never MLflow's internal tables. Use short transactions, parameterized statements, a bounded busy timeout, and WAL mode where appropriate. The API owns audit writes; dashboards consume a read-only API interface rather than mounting database files.
 - Define and test tracking-failure behavior; never silently claim an unlogged result was recorded.
 - Avoid unnecessary patient identifiers in request and prediction logs.
 
@@ -109,20 +115,22 @@ For the initial small dataset, synchronous training is acceptable with a one-tra
 ## Docker deployment
 
 - The system must start with a single **`docker compose up`** command.
-- Use Docker images and Compose services for FastAPI, MLflow, PostgreSQL, MinIO, Streamlit, and required initialization/bootstrap tasks.
-- Use separate PostgreSQL databases for MLflow metadata and application audit records.
-- Persist database contents, artifacts, and other required state with volumes.
-- Create storage buckets automatically. Add health checks, dependency readiness checks, and bounded retries.
+- Default services are FastAPI, MLflow, Streamlit, and an idempotent initialization/bootstrap task. Do not add PostgreSQL, MinIO, or a bucket-initialization service to the default stack.
+- Use separate SQLite files for MLflow metadata and application audit records, on persistent local Docker volumes. Do not share a SQLite database across hosts or put it on a network filesystem.
+- Persist local artifacts and DVC remote contents independently of disposable container layers. The DVC remote may be a documented host bind mount; SQLite files and artifacts should use named local volumes.
+- Configure MLflow artifact proxying so only MLflow needs direct access to artifact storage. Add health checks, dependency readiness checks, and bounded retries.
 - Bootstrap the pinned dataset and an initial champion when needed. Bootstrap must be idempotent and must not retrain or overwrite existing models on every restart.
 - Do not require undocumented manual setup, local caches, or pre-existing model artifacts.
 - Do not bake secrets into images or commit them to Git. Document safe local defaults and production configuration separately.
+- Bind published services to localhost by default. Document disk-space limits, consistent SQLite backups, artifact/remote backups, and the single-host concurrency limitations. Use the SQLite backup API or quiesce writers; do not assume copying a live WAL database file alone is a complete backup.
 
 ## Optional Airflow orchestration
 
 - Implement Airflow only after the required core system is working and tested.
 - Keep DAGs thin; put all business logic in `src/`.
 - A DAG may collect an inference window, validate it, generate a drift report, determine labeled-data availability, train/evaluate a candidate, and conditionally promote it.
-- If implemented, Airflow must start with the same default Compose command and have dashboard evidence.
+- Keep Airflow dependencies isolated from the application. If implemented, enable it through an explicit optional Compose profile and document its startup and dashboard evidence; plain `docker compose up` must remain minimal.
+- Choose an executor/database combination supported by the pinned Airflow release. Any Airflow-only database service belongs to the optional profile, not the default application stack.
 
 ## Tests and mandatory quality gates
 
@@ -146,6 +154,7 @@ reportUnknownVariableType = false
 - At minimum, standard-mode Pyright must pass with zero errors if strict checking is deferred and documented.
 - Test preprocessing, validation, patient-disjoint splitting, reproducibility, tracking artifacts, registry integration, promotion/rejection/rollback, API contracts, authentication, training concurrency, tracking failures, unavailable dependencies, and stable versus shifted monitoring inputs.
 - Use mocks for isolated unit tests and real services for integration tests.
+- Include local SQLite audit round trips, lock/timeout behavior, filesystem DVC push/pull with an empty cache, and MLflow SQLite metadata plus local artifact persistence. Test MLflow's HTTP artifact access separately from filesystem-only compatibility checks.
 - Include a clean-start Compose smoke test exercising readiness, training, prediction, and required artifacts.
 - Maintain a passing Docker build and check lockfile/requirements consistency.
 
