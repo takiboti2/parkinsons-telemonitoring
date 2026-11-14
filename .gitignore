@@ -8,7 +8,6 @@ wheels/
 .env
 # Virtual environments
 .venv
-.venv-airflow/
 
 # Track notebooks themselves, not Jupyter's autosaved checkpoints.
 .ipynb_checkpoints/

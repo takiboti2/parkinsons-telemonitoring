@@ -1,257 +1,41 @@
-# Project instructions
+# Development instructions
 
-## Purpose and scope
+## Scope and simplicity
 
-Build a reproducible, minimal local Parkinson's telemonitoring MLOps system. Prioritize reproducible pipelines, observable services, and reliable automation over a fixed model-score target. Automatically improve performance where feasible and prevent potential degradation through validation and guarded model promotion. The default deployment targets one machine and low write concurrency, not distributed production scale.
+- Make the smallest change that meets the request. Prefer standard configuration and existing commands over wrappers, frameworks, or speculative infrastructure.
+- Ask before expanding scope or adding unnecessary dependencies, workflows, or abstractions. Keep this a single-host, low-concurrency system.
+- Keep documentation separate: README for current setup/usage, this file for development rules, and `documents/implementation-plan.md` for remaining work. Do not repeat whole sections across them.
+- Never claim checks passed or services ran without evidence. Document material limitations and keep credentials out of code, logs, and screenshots.
 
-Do not claim that checks passed, screenshots were captured, or services ran unless they actually did. Document failures, fixes, limitations, and justified deviations.
+## Code and dependencies
 
-## Smallest standard configuration
+- Use Python 3.13 and uv. Pin direct dependencies exactly, commit `uv.lock`, and export `requirements.txt` from it. Use frozen installs in development, CI, and Docker.
+- Follow PEP8 with a 120-character line limit and type hints. Require zero Pyright errors in `src/` under the configuration in `pyproject.toml`.
+- Keep business logic in `src/parkinsons_ml/` and Streamlit as a thin adapter. Start with simple modules; create packages/directories only as needed.
+- Use SQLite and local files, not additional database/object-storage services. Keep application audit records separate from MLflow's internal tables.
 
-- Make the smallest change that satisfies the request. Prefer standard tool configuration and existing commands over custom wrappers, scripts, or abstractions.
-- Ask before adding dependencies, workflows, or supporting infrastructure beyond what the request requires. Do not expand scope to anticipate hypothetical future needs.
-- Test application logic and concrete integration risks; do not build custom test suites merely to re-test established third-party tools. Preserve all existing required quality gates.
-- Keep documentation concise: essential setup, usage, and material limitations only.
+## Data and model correctness
 
-## Dataset and modeling
+- Preserve `data/raw/parkinsons_updrs.csv`; write derived data to `data/processed/`. Track datasets with DVC and metadata/configuration with Git.
+- Predict `motor_UPDRS`. Never use `total_UPDRS`, the target, or `subject#` as predictors; use the subject identifier only for grouping/auditing.
+- Every fitted estimator must be scikit-learn's `LinearRegression`. Baseline features are `age`, `sex`, and `test_time`; the candidate adds all 16 voice features.
+- Use identical patient-disjoint development/test assignments and grouped validation folds for comparisons. Keep the final test set out of tuning and promotion.
+- Validate schema, invalid values, missing targets, and duplicates explicitly. Fit learned preprocessing only on training partitions, inside the serialized estimator pipeline.
+- Track lineage, parameters, metrics, reports, model signature, and complete pipelines in MLflow. Save artifacts for both training and prediction; log requests/predictions without unnecessary identifiers.
+- Evaluate candidates comparably, load and validate immutable versions before changing `champion`, and preserve the previous model on rejection. Guard promotion, roll back failed activation, and reconcile interrupted updates.
+- Treat drift as a signal, not proof of performance degradation. Performance reporting/retraining requires suitable labels. The system is not a clinical diagnostic service.
 
-- The raw dataset is `data/raw/parkinsons_updrs.csv`. Keep it in place and preserve the source data; write derived outputs to `data/processed/`.
-- Predict **`motor_UPDRS`**, using that exact dataset column name.
-- Exclude **`total_UPDRS`** from model inputs.
-- Use `subject#` only for patient grouping, split construction, and auditing, never as a predictor.
-- Initial predictors are voice measurements, age, sex, and `test_time`.
-- Use patient-disjoint train/validation/test partitions because patients have repeated measurements. Use grouped cross-validation on development data; keep the fixed test set out of candidate selection and promotion.
-- Fit imputation and other learned preprocessing only on training data. Package preprocessing and the estimator together in a scikit-learn pipeline for identical training and inference behavior.
-- Validate schema, types, missing targets, missing values, invalid values, and duplicates. Make cleaning decisions explicit and reproducible.
-- Every fitted model experiment must use scikit-learn's `LinearRegression` (ordinary least squares). Do not use `DummyRegressor`, random forests, Ridge, Lasso, or other estimators, including in compatibility tests.
-- The baseline uses only `age`, `sex`, and `test_time`. The full-feature candidate adds all 16 voice measurements for 19 predictors total. Compare them on identical patient-disjoint splits and grouped cross-validation folds, with training-only imputation inside each pipeline. Log MAE, RMSE, and R² without promising a particular score.
-- Preserve a versioned split manifest, data schema, and preprocessed dataset for reproducibility and export.
-- The system is not a clinical diagnostic service; document that limitation in the API and README.
+## Tests and quality gates
 
-## Python and dependency management
+- Test application behavior and concrete integration risks, not standard library functions, tool CLI startup, or test helpers for their own sake.
+- Preserve pytest's default 95% coverage gate across `src/` and tests. Do not narrow coverage or add unjustified exclusions/suppressions. Keep fixture state isolated and restored on failure.
+- Aim for zero Flake8 errors and require zero Pyright errors in source. Use the existing hooks for fast checks; put full tests, coverage, image builds, and deployment smoke tests in CI.
+- Add success/failure tests alongside implemented functionality. Do not add dummy services or notebooks just to produce tests or screenshots.
 
-- Use **uv** for environments and dependency management.
-- Maintain `pyproject.toml` and commit `uv.lock`.
-- Generate and commit `requirements.txt` with exact versions from the lockfile; do not maintain a conflicting dependency list manually.
-- Use frozen dependency resolution in CI and Docker.
-- Use Python's standard-library `sqlite3` for local audit persistence and SQLAlchemy/SQLite for MLflow metadata. Do not add PostgreSQL drivers, S3 plugins, or cloud SDKs to the default dependency set without a concrete requirement.
-- Select and document a Python version compatible with the chosen MLflow, Evidently, and optional Airflow versions.
-- Follow PEP8, use type hints, and configure a maximum line length of **120**.
-- Keep business logic under `src/parkinsons_ml/`. Streamlit and optional Airflow code must be thin adapters to tested business logic in `src/`.
+## Git and notebooks
 
-## Suggested layout
-
-```text
-src/parkinsons_ml/
-  api/
-  data/
-  modeling/
-  monitoring/
-  tracking/
-  config.py
-tests/
-  unit/
-  integration/
-  e2e/
-dashboards/
-dags/                     # Optional Airflow
-data/raw/
-data/processed/
-docker/
-scripts/
-screenshots/
-.github/workflows/
-```
-
-Adapt this layout to existing code rather than replacing established structures unnecessarily.
-
-## Data versioning and reproducibility
-
-- Use **Git** for code, configuration, documentation, and DVC metadata.
-- Use **DVC** for raw and processed datasets. Do not commit datasets or model binaries directly to Git.
-- Define reproducible validation, preparation, and splitting stages in `dvc.yaml`; commit the corresponding lockfile and metadata.
-- Configure a persistent local filesystem DVC remote and document its host/container paths. Keep it distinct from the working dataset, DVC cache, and MLflow artifacts. A clean checkout must not depend on an undocumented local cache or an already-populated remote.
-- Support an accessible pinned dataset download or a documented offline data bundle for deployment and reproducibility.
-- Do not require MinIO, cloud storage, or DVC's S3 plugin for the default local workflow.
-- Record seeds, dataset identities, split identities, and code revisions for reproducibility.
-
-## MLflow and model lifecycle
-
-- Use **MLflow Tracking** for experiments and artifacts and **MLflow Model Registry** for model versions.
-- Store metadata and registry state in a persistent SQLite file owned by the MLflow service. Store artifacts on a separate persistent local volume and serve/proxy them through MLflow; clients must not need the artifact filesystem mounted.
-- For training runs, log parameters, seeds, dependencies, feature schema, Git revision, DVC dataset identity, split metadata, metrics, evaluation reports, and promotion decisions.
-- Save the complete inference pipeline with its input example and model signature.
-- Use a registry alias such as `champion` for the deployed version and retain earlier versions for rollback.
-- Register and load a candidate by its immutable version, then smoke-test its schema and predictions before changing `champion`. Under the promotion guard, capture the previous alias/active model, update the alias, and activate the preloaded pipeline. Roll back both on activation failure; record the outcome and reconcile registry/active-model state after interrupted promotion.
-- Track and package pipelines with MLflow. MLflow is not a general workflow scheduler: use DVC for data stages and optionally Airflow for orchestration. Provide an MLflow Project training entry point where appropriate.
-- Compare candidates against the champion using comparable development validation data and a versioned acceptance policy.
-- Reject candidates with invalid data, non-finite predictions, failed evaluation, incomplete required artifacts, or unacceptable validation degradation.
-- Never use the held-out test set for automatic tuning or promotion.
-- Activate the exact prevalidated immutable model version; do not resolve a mutable alias again between validation and activation.
-- A rejected or unloadable candidate must never change the champion alias or active model. Test failed validation, failed activation, and rollback paths when implementing promotion.
-- Drift may trigger investigation or candidate training, not unconditional promotion. Retraining requires suitable labeled data.
-
-## FastAPI requirements
-
-Provide a REST API with interactive Swagger documentation and these endpoints:
-
-- `POST /train`: train, evaluate, register, and conditionally promote a candidate. Return the run ID, model version, metrics, and promotion decision.
-- `POST /predict`: validate a bounded batch, run the deployed pipeline, and return predictions, request ID, model version, and tracking run ID.
-- `GET /health/live`: process liveness.
-- `GET /health/ready`: required dependency and model readiness.
-
-For the initial small dataset, synchronous training is acceptable with a one-training-job-at-a-time guard. Add a durable job queue only if needed; do not run critical jobs as untracked in-process background tasks.
-
-Run one API worker and one API replica in the default local deployment. Keep training and promotion within that single writer's guarded workflow. Revisit locking and storage before adding processes or replicas.
-
-- Accept only approved dataset versions and bounded configuration, not arbitrary paths or executable input.
-- Protect training with authentication and keep secrets out of source control and logs.
-- Save artifacts with MLflow for **both training and prediction**.
-- Initially, use one MLflow inference run per request batch, storing validated inputs, predictions, timestamps, schema version, model identity, and latency.
-- Persist structured incoming-request and prediction records suitable for Evidently reports.
-- Use a separate persistent SQLite audit database, never MLflow's internal tables. Use short transactions, parameterized statements, a bounded busy timeout, and WAL mode where appropriate. The API owns audit writes; dashboards consume a read-only API interface rather than mounting database files.
-- Define and test tracking-failure behavior; never silently claim an unlogged result was recorded.
-- Avoid unnecessary patient identifiers in request and prediction logs.
-
-## Monitoring and dashboard
-
-- Use **Evidently** to compare versioned training reference data with recent logged inference data.
-- Monitor feature drift, missingness, invalid values, and prediction distribution changes.
-- Report model-performance changes only when ground-truth labels are available; feature drift alone does not demonstrate performance degradation.
-- Build a **Streamlit** dashboard showing active model identity, training run, recent predictions, request volume, data quality, Evidently reports, drift status, and promotion decisions.
-- Keep report generation and decision logic in `src/`, not in the Streamlit entry point.
-- Provide a deterministic simulated drift scenario for tests and demonstrations, clearly labeled as synthetic.
-
-## Docker deployment
-
-- The system must start with a single **`docker compose up`** command.
-- Default services are FastAPI, MLflow, Streamlit, and an idempotent initialization/bootstrap task. Do not add PostgreSQL, MinIO, or a bucket-initialization service to the default stack.
-- Use separate SQLite files for MLflow metadata and application audit records, on persistent local Docker volumes. Do not share a SQLite database across hosts or put it on a network filesystem.
-- Persist local artifacts and DVC remote contents independently of disposable container layers. The DVC remote may be a documented host bind mount; SQLite files and artifacts should use named local volumes.
-- Configure MLflow artifact proxying so only MLflow needs direct access to artifact storage. Add health checks, dependency readiness checks, and bounded retries.
-- Bootstrap the pinned dataset and an initial champion when needed. Bootstrap must be idempotent and must not retrain or overwrite existing models on every restart.
-- Do not require undocumented manual setup, local caches, or pre-existing model artifacts.
-- Do not bake secrets into images or commit them to Git. Document safe local defaults and production configuration separately.
-- Bind published services to localhost by default. Document disk-space limits, consistent SQLite backups, artifact/remote backups, and the single-host concurrency limitations. Use the SQLite backup API or quiesce writers; do not assume copying a live WAL database file alone is a complete backup.
-
-## Optional Airflow orchestration
-
-- Implement Airflow only after the required core system is working and tested.
-- Keep DAGs thin; put all business logic in `src/`.
-- A DAG may collect an inference window, validate it, generate a drift report, determine labeled-data availability, train/evaluate a candidate, and conditionally promote it.
-- Keep Airflow dependencies isolated from the application. If implemented, enable it through an explicit optional Compose profile and document its startup and dashboard evidence; plain `docker compose up` must remain minimal.
-- Choose an executor/database combination supported by the pinned Airflow release. Any Airflow-only database service belongs to the optional profile, not the default application stack.
-
-## Tests and mandatory quality gates
-
-- Use pytest and **coverage**. Enforce at least **95% Python test coverage** across all Python code in `src/` **and the Python test code itself**.
-- Configure measurement to include test modules; unexecuted test code is also a defect.
-- Keep pytest discovery, coverage sources (`src` and `tests`), and the 95% threshold in `pyproject.toml`. `uv run --frozen pytest` must enforce coverage by default; do not document a tests-only coverage override as the full quality gate.
-- Isolate MLflow test configuration, including tracking/registry URI overrides, experiment selection, environment variables, and active runs. Use teardown that restores prior state even on test failure; avoid leaking temporary database paths into subsequent tests. Any test-only patches to pinned MLflow internals must be narrowly documented and reviewed on dependency upgrades.
-- Streamlit and Airflow adapters may remain thin, but their business logic belongs in covered `src/` code.
-- Do not game coverage with exclusions. `# pragma: no cover` or coverage omissions require an explicit adjacent justification; for configuration omissions, place the explanation beside the configuration.
-- Aim for zero Flake8 violations, with an upper limit of 1% of all Python lines; `noqa` requires an adjacent justification.
-- Require zero Pyright errors in `src/`. Target this strict configuration from the outset:
-
-```toml
-[tool.pyright]
-include = ["src"]
-typeCheckingMode = "strict"
-reportMissingTypeStubs = false
-reportUnknownMemberType = false
-reportUnknownArgumentType = false
-reportUnknownVariableType = false
-```
-
-- At minimum, standard-mode Pyright must pass with zero errors if strict checking is deferred and documented.
-- Test preprocessing, validation, patient-disjoint splitting, reproducibility, tracking artifacts, registry integration, promotion/rejection/rollback, API contracts, authentication, training concurrency, tracking failures, unavailable dependencies, and stable versus shifted monitoring inputs.
-- Use mocks for isolated unit tests and real services for integration tests.
-- Include local SQLite audit round trips, lock/timeout behavior, filesystem DVC push/pull with an empty cache, and MLflow SQLite metadata plus local artifact persistence. Test MLflow's HTTP artifact access separately from filesystem-only compatibility checks.
-- Include a clean-start Compose smoke test exercising readiness, training, prediction, and required artifacts.
-- Maintain a passing Docker build and check lockfile/requirements consistency.
-- Exclude both `.venv` and `.venv-airflow` from root-level Flake8 discovery; virtual-environment contents are not project source.
-
-## Pre-commit and CI
-
-- Configure **pre-commit** for fast formatting, Flake8, Pyright, file hygiene, configuration validation, large-file checks, and secret detection where practical.
-- Local setup and full checks should be available through:
-
-```bash
-uv run pre-commit install
-uv run pre-commit run --all-files
-```
-
-- Hooks may modify formatting; review and stage those changes before retrying the commit.
-- Do not put slow Docker builds or the full integration suite on every local commit. Keep local feedback fast to support frequent meaningful commits.
-- GitHub Actions must explicitly run pre-commit checks: GitHub does not automatically execute local Git hooks.
-- CI must also run the full test suite, enforce coverage, build Docker images, start the Compose stack, and execute API smoke tests.
-- Publish test and coverage reports as CI artifacts.
-- Configure required status checks and branch protection where repository permissions allow; local hooks alone can be bypassed.
-
-## Git workflow
-
-### Jupyter notebooks
-
-- Track `.ipynb` files directly; ignore `.ipynb_checkpoints/`. Use nbstripout through the uv-managed pre-commit hook and nbdime for notebook-aware local Git diffs/merges.
-- Invoke `uv run --frozen nbstripout` directly from the pre-commit hook. Use its standard behavior, with no custom wrapper, dedicated notebook tooling tests, or notebook workflow. Stripping modifies working copies; `nbstripout --verify` checks without modifying them. Do not use output-retention metadata/tags to bypass the no-output convention.
-- Follow README's per-clone commands to install hooks and register uv-resolved nbdime diff/merge drivers in local `.git/config` only. Do not change global Git configuration or install a competing nbstripout clean/diff filter. Keep direct notebook-tool dependencies limited to pinned `nbstripout` and `nbdime`; notebook execution tools are separate.
-- Keep reusable business logic in covered `src/` modules; notebooks must use only `LinearRegression` for fitted models. Do not embed credentials or private records in source, Markdown, or attachments.
-- Hygiene checks do not execute notebooks or lint/type-check their code cells. Add separate clean-kernel execution checks when analysis notebooks exist, with DVC-provided data and bounded timeouts. Keep the full source/test coverage gate intact.
-
-### Commits and review
-
-- Initialize Git before implementation if it is not initialized already.
-- Make frequent, meaningful commits throughout development. Preserve incremental changes and fixes; do not fabricate history or split changes artificially to inflate commit counts.
-- Follow the repository's established commit-message format; confirm the convention if none exists.
-- Keep `main` clean and passing. Except for allowed typo fixes, changes must reach `main` through merges.
-- Use at least two feature branches and preserve their history, preferably through pull requests and merge commits rather than squash merges.
-- For collaborative development, request reviews and record review notes for each feature branch before merging.
-- Never discard existing user changes or publish to a remote without authorization.
-
-## README and evidence
-
-Keep project documentation in **README.md**, including:
-
-- Architecture, responsibilities of tools, and prerequisites.
-- Dataset provenance/license, target, excluded features, and leakage controls.
-- One-command startup, endpoints, Swagger, and example requests.
-- uv development commands, DVC access, reproduction instructions, and dependency management.
-- Tracking, registry, evaluation, promotion, rollback, and monitoring policies.
-- Test, coverage, lint, typing, and CI commands.
-- Configuration, secrets, persistence, and known limitations or technical debt.
-- A short description of AI assistance and how it was used.
-- Links to actual screenshots committed under `screenshots/`.
-
-Version the technical implementation plan at `documents/implementation-plan.md` alongside code and keep it consistent with these instructions and README. Only disposable generated reports under `documents/reports/` are ignored; do not exclude the entire documents directory.
-
-Capture genuine screenshots of:
-
-1. MLflow dashboard, experiments, and registry.
-2. Working training and prediction requests using Swagger, Postman, or Python.
-3. Running Docker containers.
-4. Streamlit displaying an Evidently report.
-5. Test results and coverage.
-6. Airflow dashboard, if implemented.
-
-Do not substitute fabricated images or claims for running-system evidence.
-
-## Reproducible exports
-
-- Provide a versioned preprocessed dataset export with its schema and provenance.
-- Document the repository revision, dataset version, model version, and dependency lockfile needed to reproduce a release.
-- Document offline setup when external storage or private repository access is unavailable.
-- Keep credentials and sensitive records out of exported bundles.
-
-## Implementation priorities
-
-1. Git, uv, code-quality configuration, and initial CI.
-2. DVC, dataset validation, and leakage-safe splitting.
-3. Training pipeline, MLflow tracking, and model registry.
-4. FastAPI endpoints, inference logging, and integration tests.
-5. Guarded automated model selection and promotion.
-6. Evidently reporting and Streamlit.
-7. Reliable one-command Docker Compose deployment and end-to-end CI.
-8. Optional Airflow.
-9. Verified screenshots, complete README, and reproducible exports.
-
-Build incrementally, keep tests alongside implementation, and document deviations rather than silently dropping requirements.
+- Preserve user changes. Do not stage, commit, publish, or discard work without authorization; follow the established commit convention.
+- Use meaningful incremental commits and preserved feature branches/merges for feature work. Keep `main` passing; bootstrap configuration may be committed directly when explicitly approved.
+- Track `.ipynb` files, ignore checkpoints, and invoke nbstripout directly from pre-commit. Use nbdime's repository-local diff/merge drivers, not global settings or custom scripts.
+- Do not use notebook metadata/tags to retain outputs. Review source/Markdown/attachments for secrets. Keep notebook execution tools separate from Git tooling.
+- Version the implementation plan; ignore only disposable reports under `documents/reports/`. Capture genuine running-system evidence when the services exist.
