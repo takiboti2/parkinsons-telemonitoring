@@ -1,7 +1,6 @@
 """Deterministic preparation with auditable row cleaning and patient splits."""
 
 import argparse
-import csv
 import hashlib
 import json
 import logging
@@ -11,10 +10,12 @@ import shutil
 import tempfile
 from collections import Counter
 from dataclasses import asdict, dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import TypeAlias
+from typing import Literal, TypeAlias, TypedDict
 
 import numpy as np
+import pandas as pd
 import yaml
 from sklearn.model_selection import GroupKFold, train_test_split
 
@@ -26,13 +27,74 @@ from parkinsons_ml.schema import (
     MISSING_TOKENS,
     POLICY_VERSION,
     SCHEMA_VERSION,
-    clip_test_time,
     validate_headers,
 )
 
 LOGGER = logging.getLogger(__name__)
-Row: TypeAlias = dict[str, float]
 Event: TypeAlias = dict[str, str | int]
+
+
+class CleaningSummary(TypedDict):
+    """Counts produced by cleaning, before a dataset can necessarily be split."""
+
+    input_rows: int
+    invalid_rows_dropped: int
+    duplicate_rows_dropped: int
+    unique_rows_dropped: int
+    retained_rows: int
+    clipped_rows: int
+    reason_counts: dict[str, int]
+    missing_before: dict[str, int]
+    missing_after: dict[str, int]
+    identifiable_patients_before: int
+    patients_after: int
+    patients_completely_removed: int
+
+
+class PartitionSummary(TypedDict):
+    """Patient and measurement proportions for one exported partition."""
+
+    rows: int
+    patients: int
+    row_fraction: float
+    patient_fraction: float
+
+
+class FoldSummary(TypedDict):
+    """Validation-patient and measurement counts for a saved fold."""
+
+    patients: int
+    rows: int
+
+
+class ExtremeBounds(TypedDict):
+    """Usable train-derived bounds and descriptive counts."""
+
+    status: Literal["ok"]
+    lower: float
+    upper: float
+    train_count: int
+    test_count: int
+
+
+class SkippedExtreme(TypedDict):
+    """An explicit reason why no statistical bounds are available."""
+
+    status: Literal["insufficient_observations", "zero_iqr", "unrepresentable_bounds"]
+    train_count: None
+    test_count: None
+
+
+ExtremeReport: TypeAlias = dict[str, ExtremeBounds | SkippedExtreme]
+
+
+class PreparationSummary(CleaningSummary):
+    """A complete successful report; failure diagnostics can contain less data."""
+
+    partitions: dict[str, PartitionSummary]
+    folds: dict[str, FoldSummary]
+    extremes: ExtremeReport
+    status: Literal["complete"]
 
 
 @dataclass(frozen=True)
@@ -45,6 +107,8 @@ class PrepareConfig:
     extreme_iqr_multiplier: float = 1.5
 
     def __post_init__(self) -> None:
+        # Reject unusable settings before splitting. Explicit integer checks also
+        # exclude booleans, which Python otherwise treats as integer values.
         if type(self.seed) is not int or not 0 <= self.seed < 2**32:
             raise ValueError("seed must be an integer in [0, 2**32)")
         if not 0 < self.test_fraction < 1:
@@ -57,6 +121,8 @@ class PrepareConfig:
 
 def write_json(path: Path, value: object) -> None:
     """Write portable JSON without nonstandard NaN/Infinity values."""
+    # Stable ordering and no run timestamp allow identical inputs to produce
+    # byte-identical artifacts; nonfinite statistics must be handled explicitly.
     path.write_text(json.dumps(value, sort_keys=True, indent=2, allow_nan=False) + "\n", encoding="utf-8")
 
 
@@ -64,80 +130,138 @@ def checksum(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def missingness(rows: list[Row]) -> dict[str, int]:
-    return {name: sum(math.isnan(row[name]) for row in rows) for name in COLUMNS}
+def missingness(frame: pd.DataFrame) -> dict[str, int]:
+    return {name: int(frame[name].isna().sum()) for name in COLUMNS}
 
 
-def clean_data(raw: Path) -> tuple[list[Row], list[Event], dict[str, object]]:
-    """Parse explicit missing tokens, reject bad rows, then deduplicate and clip."""
-    missing_before = dict.fromkeys(COLUMNS, 0)
-    retained: list[Row] = []
+def parse_subject(token: str) -> tuple[int | None, str | None]:
+    """Validate patient identifiers without a lossy float conversion."""
+    if token in MISSING_TOKENS:
+        return None, "missing_required"
+    try:
+        # Binary64 can merge distinct large identifiers. Decimal checks the exact
+        # token before conversion to an arbitrary-precision Python integer.
+        value = Decimal(token)
+    except InvalidOperation:
+        return None, "malformed_numeric"
+    if not value.is_finite():
+        return None, "nonfinite_numeric"
+    if value != value.to_integral_value():
+        return None, "noninteger_value"
+    return int(value), None
+
+
+def clean_data(raw: Path) -> tuple[pd.DataFrame, list[Event], CleaningSummary]:
+    """Read raw CSV into a DataFrame, then validate and clean with pandas masks."""
     events: list[Event] = []
-    seen: dict[tuple[float | None, ...], int] = {}
-    identifiable_patients: set[float] = set()
-    invalid_rows = 0
-    duplicate_rows = 0
-    input_rows = 0
-    with raw.open(newline="", encoding="utf-8") as stream:
-        reader = csv.reader(stream, strict=True)
-        headers = next(reader, [])
-        validate_headers(headers)
-        for number, values in enumerate(reader, start=1):
-            input_rows += 1
-            if len(values) != len(headers):
-                events.append({"row": number, "action": "drop", "reason": "row_width", "column": ""})
-                invalid_rows += 1
-                continue
-            row: Row = {}
-            reasons: list[tuple[str, str]] = []
-            for raw_name, text in zip(headers, values, strict=True):
-                name = COLUMN_MAPPING[raw_name]
-                token = text.strip()
-                if token in MISSING_TOKENS:
-                    missing_before[name] += 1
-                    value = math.nan
-                    if name in ("subject", "motor_updrs"):
-                        reasons.append((name, "missing_required"))
-                else:
-                    try:
-                        value = float(token)
-                    except ValueError:
-                        value = math.nan
-                        reasons.append((name, "malformed_numeric"))
-                    else:
-                        if not math.isfinite(value):
-                            reasons.append((name, "nonfinite_numeric"))
-                        elif name in ("subject", "age") and not value.is_integer():
-                            reasons.append((name, "noninteger_value"))
-                        elif name == "sex" and value not in (0, 1):
-                            reasons.append((name, "invalid_sex"))
-                row[name] = value
-            subject = row["subject"]
-            if math.isfinite(subject) and subject.is_integer():
-                identifiable_patients.add(subject)
-            if reasons:
-                invalid_rows += 1
-                events.extend(
-                    {"row": number, "action": "drop", "reason": reason, "column": name} for name, reason in reasons
-                )
-                continue
-            key = tuple(None if math.isnan(row[name]) else row[name] for name in COLUMNS)
-            if key in seen:
-                duplicate_rows += 1
-                events.append(
-                    {"row": number, "action": "drop", "reason": "duplicate", "column": "", "duplicate_of": seen[key]}
-                )
-                continue
-            seen[key] = number
-            if row["test_time"] < 0:
-                events.append({"row": number, "action": "clip", "reason": "negative_test_time", "column": "test_time"})
-            row["test_time"] = clip_test_time(row["test_time"])
-            retained.append(row)
-    patients_after = {row["subject"] for row in retained}
+    try:
+        # Keep headers as the first row so pandas cannot silently rename duplicates.
+        # Keep literal strings so missing tokens and malformed values stay distinct.
+        frame = pd.read_csv(
+            raw,
+            header=None,
+            dtype=str,
+            keep_default_na=False,
+            na_filter=False,
+            skip_blank_lines=False,
+            engine="python",
+            on_bad_lines="error",
+            encoding="utf-8",
+        )
+    except pd.errors.EmptyDataError as error:
+        raise ValueError("Invalid raw schema: empty CSV") from error
+    headers = frame.iloc[0].tolist()
+    validate_headers(headers)
+    # Retaining the existing index gives the first data record number 1. Do not
+    # reset it after filtering: cleaning events refer back to these source records.
+    tokens = frame.iloc[1:].copy()
+    tokens.columns = pd.Index(headers)
+    input_rows = len(tokens)
+    # The Python parser uses None for absent fields, but preserves explicit empty
+    # fields as strings. Reject truncated records without losing their row numbers.
+    truncated = tokens.isna().any(axis=1)
+    width_errors = int(truncated.sum())
+    events.extend(
+        {"row": int(index), "action": "drop", "reason": "row_width", "column": ""} for index in tokens.index[truncated]
+    )
+    tokens = tokens.loc[~truncated].rename(columns=COLUMN_MAPPING)
+    tokens = pd.DataFrame({name: tokens[name].str.strip() for name in COLUMNS}, index=tokens.index)
+    # Save genuine missingness before coercion: a malformed string may also become
+    # NaN, but must be dropped rather than silently accepted for later imputation.
+    missing = tokens.isin(list(MISSING_TOKENS))
+    numeric = pd.DataFrame(tokens.mask(missing).apply(pd.to_numeric, errors="coerce"), dtype=float)
+    invalid = pd.Series(False, index=tokens.index)
+
+    def record(mask: pd.Series, column: str, reason: str) -> None:
+        # A row can have several audit reasons but is removed only once, using
+        # the union of all invalid-value masks.
+        nonlocal invalid
+        invalid |= mask
+        events.extend(
+            {"row": int(index), "action": "drop", "reason": reason, "column": column} for index in tokens.index[mask]
+        )
+
+    subjects: list[int | None] = []
+    for index, token in zip(tokens.index, tokens["subject"], strict=True):
+        subject, reason = parse_subject(str(token))
+        subjects.append(subject)
+        if reason is not None:
+            invalid.loc[index] = True
+            events.append({"row": int(index), "action": "drop", "reason": reason, "column": "subject"})
+    # Python integers in an object column preserve identifiers beyond binary64/int64.
+    numeric["subject"] = pd.Series(subjects, index=tokens.index, dtype=object)
+    identifiable_patients = set(numeric["subject"].dropna())
+    # Validate every supplied numeric column, including the excluded total score.
+    # Missing predictors remain valid; only labels and grouping IDs are required.
+    for name in COLUMNS:
+        if name == "subject":
+            continue
+        nonfinite = (~missing[name]) & (
+            tokens[name].str.fullmatch(r"[+-]?(?:nan|inf(?:inity)?)", case=False) | np.isinf(numeric[name])
+        )
+        # Distinguish nonfinite spellings from the explicitly accepted NA tokens.
+        malformed = numeric[name].isna() & ~missing[name] & ~nonfinite
+        record(nonfinite, name, "nonfinite_numeric")
+        record(malformed, name, "malformed_numeric")
+        if name == "motor_updrs":
+            record(pd.Series(missing[name], index=tokens.index), name, "missing_required")
+        elif name == "age":
+            record(numeric[name].notna() & ~nonfinite & numeric[name].mod(1).ne(0), name, "noninteger_value")
+        elif name == "sex":
+            record(~missing[name] & ~nonfinite & ~malformed & ~numeric[name].isin([0, 1]), name, "invalid_sex")
+    valid = numeric.loc[~invalid].copy()
+    # Compare all 22 columns before dropping total_updrs or clipping times, so
+    # distinct repeated measurements are not mistaken for exact duplicate copies.
+    duplicates = valid.duplicated(keep="first")
+    first_rows = valid.groupby(list(COLUMNS), dropna=False, sort=False)["subject"].transform("idxmin")
+    # Equal rows share a subject value; idxmin therefore identifies the first
+    # source record in each group. Include missing values in duplicate groups.
+    for index in valid.index[duplicates]:
+        events.append(
+            {
+                "row": int(index),
+                "action": "drop",
+                "reason": "duplicate",
+                "column": "",
+                "duplicate_of": int(first_rows.loc[index]),
+            }
+        )
+    retained = valid.loc[~duplicates].copy()
+    # Record only actions on retained rows. Negative infinity was already invalid;
+    # pandas clip preserves missing times for training-fitted imputation.
+    for index in retained.index[retained["test_time"].lt(0)]:
+        events.append({"row": int(index), "action": "clip", "reason": "negative_test_time", "column": "test_time"})
+    retained["test_time"] = retained["test_time"].clip(lower=0)
+    events.sort(key=lambda event: (int(event["row"]), str(event["column"]), str(event["reason"])))
+    patients_after = set(retained["subject"])
+    # Reason totals can overlap, unlike the unique dropped-row totals. Reporting
+    # patient loss also exposes cases where cleaning removes every visit of a patient.
+    invalid_rows = int(invalid.sum()) + width_errors
+    duplicate_rows = int(duplicates.sum())
     counts = dict(sorted(Counter(str(event["reason"]) for event in events).items()))
     for reason, count in counts.items():
         LOGGER.warning("Preparation %s: %d events", reason, count)
-    summary: dict[str, object] = {
+    summary: CleaningSummary = {
         "input_rows": input_rows,
         "invalid_rows_dropped": invalid_rows,
         "duplicate_rows_dropped": duplicate_rows,
@@ -145,7 +269,7 @@ def clean_data(raw: Path) -> tuple[list[Row], list[Event], dict[str, object]]:
         "retained_rows": len(retained),
         "clipped_rows": sum(event["action"] == "clip" for event in events),
         "reason_counts": counts,
-        "missing_before": missing_before,
+        "missing_before": {name: int(missing[name].sum()) for name in COLUMNS},
         "missing_after": missingness(retained),
         "identifiable_patients_before": len(identifiable_patients),
         "patients_after": len(patients_after),
@@ -154,42 +278,52 @@ def clean_data(raw: Path) -> tuple[list[Row], list[Event], dict[str, object]]:
     return retained, events, summary
 
 
-def assign_splits(rows: list[Row], config: PrepareConfig) -> list[dict[str, int | str]]:
+def assign_splits(rows: pd.DataFrame, config: PrepareConfig) -> pd.DataFrame:
     """Assign each patient once, with reproducible grouped validation folds."""
-    patients = sorted({row["subject"] for row in rows})
+    # Sort unique IDs before seeded sampling so the patient assignment does not
+    # depend on the order in which their measurements appeared in the CSV.
+    patients: list[int] = sorted(int(value) for value in rows["subject"].unique())
     test_count = math.ceil(len(patients) * config.test_fraction)
     if len(patients) - test_count < config.validation_folds or test_count < 1:
         raise ValueError("Insufficient patients for nonempty train/test and requested grouped folds")
     train, test = train_test_split(patients, test_size=config.test_fraction, random_state=config.seed)
-    train_patients = set(train)
-    groups = [int(row["subject"]) for row in rows if row["subject"] in train_patients]
+    # Only train patients participate in validation. The dummy feature array is
+    # used for its length; GroupKFold assigns rows according to patient groups.
+    groups = rows.loc[rows["subject"].isin(list(train)), "subject"].to_numpy()
     folds: dict[int, int] = {}
     splitter = GroupKFold(n_splits=config.validation_folds, shuffle=True, random_state=config.seed)
     for fold, (_, validation) in enumerate(splitter.split(np.zeros(len(groups)), groups=groups)):
         for index in validation:
-            folds[groups[int(index)]] = fold
+            folds[int(groups[int(index)])] = fold
     test_patients = set(test)
-    return [
-        {
-            "subject": int(patient),
-            "partition": "test" if patient in test_patients else "train",
-            "validation_fold": "" if patient in test_patients else folds[int(patient)],
-        }
-        for patient in patients
-    ]
+    # Export one assignment per patient for both models to reuse. Test patients
+    # deliberately have no validation-fold number.
+    return pd.DataFrame(
+        [
+            {
+                "subject": int(patient),
+                "partition": "test" if patient in test_patients else "train",
+                "validation_fold": "" if patient in test_patients else folds[int(patient)],
+            }
+            for patient in patients
+        ]
+    )
 
 
-def extreme_report(train: list[Row], test: list[Row], multiplier: float) -> dict[str, object]:
+def extreme_report(train: pd.DataFrame, test: pd.DataFrame, multiplier: float) -> ExtremeReport:
     """Descriptive flags only; thresholds never learn from test values."""
-    report: dict[str, object] = {}
+    report: ExtremeReport = {}
     for name in CANDIDATE_FEATURES:
         if name == "sex":
+            # Binary category codes are not continuous outlier measurements.
             continue
-        values = [row[name] for row in train if not math.isnan(row[name])]
+        values = train[name].dropna()
+        # Test observations never influence reference thresholds. Explicit skip
+        # statuses avoid presenting undefined or degenerate bounds as real checks.
         if len(values) < 4:
             report[name] = {"status": "insufficient_observations", "train_count": None, "test_count": None}
             continue
-        q1, q3 = (float(value) for value in np.quantile(values, [0.25, 0.75]))
+        q1, q3 = (float(value) for value in values.quantile([0.25, 0.75]))
         iqr = q3 - q1
         if iqr == 0:
             report[name] = {"status": "zero_iqr", "train_count": None, "test_count": None}
@@ -202,31 +336,31 @@ def extreme_report(train: list[Row], test: list[Row], multiplier: float) -> dict
             "status": "ok",
             "lower": lower,
             "upper": upper,
-            "train_count": sum(row[name] < lower or row[name] > upper for row in train),
-            "test_count": sum(row[name] < lower or row[name] > upper for row in test),
+            "train_count": int((train[name].lt(lower) | train[name].gt(upper)).sum()),
+            "test_count": int((test[name].lt(lower) | test[name].gt(upper)).sum()),
         }
     return report
 
 
-def write_csv(path: Path, columns: tuple[str, ...], rows: list[dict[str, object]]) -> None:
+def write_csv(path: Path, columns: tuple[str, ...], rows: pd.DataFrame) -> None:
     """Export float repr precision, with empty fields for missing values."""
-    with path.open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=columns, extrasaction="ignore", lineterminator="\n")
-        writer.writeheader()
-        for row in rows:
-            writer.writerow(
-                {key: "" if isinstance(value, float) and math.isnan(value) else value for key, value in row.items()}
-            )
+    # Fix the column order and omit the DataFrame index. Source-record references
+    # live in the audit artifact rather than becoming accidental model features.
+    rows.reindex(columns=list(columns)).to_csv(path, index=False, na_rep="", lineterminator="\n")
 
 
 def publish(stage: Path, output: Path) -> None:
     """Swap complete directories; preserve previous outputs if activation fails."""
     backup = output.with_name(f".{output.name}.previous")
+    # Renames stay on the same filesystem because staging is beside the output.
+    # Keep the old directory available until the staged directory is activated.
     if output.exists():
         os.replace(output, backup)
     try:
         os.replace(stage, output)
     except OSError:
+        # Restore the old directory when activation itself fails; cleanup after
+        # successful activation is a separate operation below.
         if backup.exists():
             os.replace(backup, output)
         raise
@@ -234,9 +368,11 @@ def publish(stage: Path, output: Path) -> None:
         shutil.rmtree(backup)
 
 
-def prepare(raw: Path, output: Path, config: PrepareConfig, failure_report: Path) -> dict[str, object]:
+def prepare(raw: Path, output: Path, config: PrepareConfig, failure_report: Path) -> PreparationSummary:
     """Prepare artifacts without depending on MLflow or mutating the raw dataset."""
-    summary: dict[str, object] = {}
+    # No report exists until cleaning returns. Keep partial failure diagnostics
+    # distinct from the fully populated report promised to successful callers.
+    summary: CleaningSummary | PreparationSummary | None = None
     events: list[Event] = []
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -250,47 +386,62 @@ def prepare(raw: Path, output: Path, config: PrepareConfig, failure_report: Path
         raw_hash = checksum(raw)
         rows, events, summary = clean_data(raw)
         assignments = assign_splits(rows, config)
-        partitions = {int(item["subject"]): item["partition"] for item in assignments}
-        train = [row for row in rows if partitions[int(row["subject"])] == "train"]
-        test = [row for row in rows if partitions[int(row["subject"])] == "test"]
-        summary["partitions"] = {
+        # Expand patient-level assignments back to measurement rows. No row-level
+        # random split is allowed, as that would leak patients across partitions.
+        patient_partitions = {
+            int(subject): str(partition)
+            for subject, partition in zip(assignments["subject"], assignments["partition"], strict=True)
+        }
+        partitions = pd.Series(rows["subject"], index=rows.index).map(patient_partitions)
+        train = rows.loc[partitions.eq("train")].copy()
+        test = rows.loc[partitions.eq("test")].copy()
+        partition_summary: dict[str, PartitionSummary] = {
             name: {
                 "rows": len(partition),
-                "patients": len({row["subject"] for row in partition}),
+                "patients": int(partition["subject"].nunique()),
                 "row_fraction": len(partition) / len(rows),
-                "patient_fraction": len({row["subject"] for row in partition}) / len(assignments),
+                "patient_fraction": int(partition["subject"].nunique()) / len(assignments),
             }
             for name, partition in (("train", train), ("test", test))
         }
-        summary["folds"] = {
+        fold_summary: dict[str, FoldSummary] = {
             str(fold): {
-                "patients": sum(item["validation_fold"] == fold for item in assignments),
-                "rows": sum(
-                    row["subject"] in {item["subject"] for item in assignments if item["validation_fold"] == fold}
-                    for row in train
+                "patients": int(assignments["validation_fold"].eq(fold).sum()),
+                "rows": int(
+                    train["subject"].isin(assignments.loc[assignments["validation_fold"].eq(fold), "subject"]).sum()
                 ),
             }
             for fold in range(config.validation_folds)
         }
-        summary["extremes"] = extreme_report(train, test, config.extreme_iqr_multiplier)
-        summary["status"] = "complete"
+        report: PreparationSummary = {
+            **summary,
+            "partitions": partition_summary,
+            "folds": fold_summary,
+            "extremes": extreme_report(train, test, config.extreme_iqr_multiplier),
+            "status": "complete",
+        }
+        summary = report
+        # Build the entire artifact set before publishing any of it. A failed
+        # export leaves existing outputs in place and removes temporary files.
         with tempfile.TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as temporary:
             stage = Path(temporary) / "artifacts"
             stage.mkdir()
-            write_csv(stage / "train.csv", EXPORT_COLUMNS, [dict(row) for row in train])
-            write_csv(stage / "test.csv", EXPORT_COLUMNS, [dict(row) for row in test])
+            write_csv(stage / "train.csv", EXPORT_COLUMNS, train)
+            write_csv(stage / "test.csv", EXPORT_COLUMNS, test)
             write_csv(
                 stage / "split_assignments.csv",
                 ("subject", "partition", "validation_fold"),
-                [dict(item) for item in assignments],
+                assignments,
             )
             write_csv(
                 stage / "cleaning_events.csv",
                 ("row", "action", "reason", "column", "duplicate_of"),
-                [dict(event) for event in events],
+                pd.DataFrame(events),
             )
-            write_json(stage / "validation_summary.json", summary)
+            write_json(stage / "validation_summary.json", report)
             split_hash = checksum(stage / "split_assignments.csv")
+            # Hash the other artifacts before writing the manifest: including its
+            # own checksum would create a circular dependency.
             write_json(
                 stage / "manifest.json",
                 {
@@ -305,16 +456,22 @@ def prepare(raw: Path, output: Path, config: PrepareConfig, failure_report: Path
                 },
             )
             if checksum(raw) != raw_hash:
+                # Detect a source change during the run rather than attributing
+                # prepared artifacts to a raw-file identity that is no longer valid.
                 raise ValueError("Raw data changed during preparation")
             publish(stage, output)
-    except (ValueError, OSError, csv.Error) as error:
-        summary["status"] = "failed"
+    except (ValueError, OSError) as error:
+        # Diagnostics are separate from successful DVC outputs. Re-raise so the
+        # caller/DVC sees a failure rather than accepting incomplete preparation.
+        failed_summary = {**(summary or {}), "status": "failed"}
         failure_report.parent.mkdir(parents=True, exist_ok=True)
-        write_json(failure_report, {"status": "failed", "error": str(error), "summary": summary, "events": events})
+        write_json(
+            failure_report, {"status": "failed", "error": str(error), "summary": failed_summary, "events": events}
+        )
         LOGGER.error("Preparation failed; diagnostics: %s", failure_report)
         raise
     LOGGER.info("Prepared %d train and %d test rows", len(train), len(test))
-    return summary
+    return report
 
 
 def main() -> None:
@@ -324,6 +481,8 @@ def main() -> None:
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     settings = yaml.safe_load(args.params.read_text(encoding="utf-8"))
+    # The CLI reads preparation settings only; it neither downloads replacement
+    # data nor requires a running MLflow server.
     config = PrepareConfig(**settings["prepare"])
     prepare(
         Path("data/raw/parkinsons_updrs.csv"),

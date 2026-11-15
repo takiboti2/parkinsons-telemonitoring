@@ -103,7 +103,7 @@ See README for commands and the data dictionary for policy. Remaining integratio
 - Add tests alongside application behavior: data validation/leakage prevention,
   training/serialization, promotion rejection, endpoint contracts, logging failures,
   and stable/shifted monitoring data. Use real-service integration tests where needed.
-- Enforce at least 95% coverage across `src/` and tests, zero source Pyright errors,
+- Enforce at least 95% coverage across `src/` and tests, zero Pyright errors in both,
   and the configured Flake8/formatting gates. Do not re-test standard tool behavior.
 - Extend the same CI workflow with image builds and a Compose train/predict smoke test.
 - Keep README to working setup/usage and material limitations; keep development rules

@@ -7,14 +7,24 @@ import logging
 import math
 import os
 import sys
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 
 import numpy as np
 import pandas as pd
 import pytest
 
 from parkinsons_ml import data
-from parkinsons_ml.data import PrepareConfig, assign_splits, clean_data, extreme_report, prepare
+from parkinsons_ml.data import (
+    ExtremeReport,
+    PreparationSummary,
+    PrepareConfig,
+    assign_splits,
+    clean_data,
+    extreme_report,
+    prepare,
+)
 from parkinsons_ml.schema import (
     CANDIDATE_FEATURES,
     COLUMN_MAPPING,
@@ -56,7 +66,7 @@ def snapshot(path: Path) -> dict[str, bytes]:
     return {item.name: item.read_bytes() for item in path.iterdir()}
 
 
-def run_prepare(tmp_path: Path, raw: Path, config: PrepareConfig = PrepareConfig()) -> dict[str, object]:
+def run_prepare(tmp_path: Path, raw: Path, config: PrepareConfig = PrepareConfig()) -> PreparationSummary:
     return prepare(raw, tmp_path / "processed", config, tmp_path / "reports" / "failure.json")
 
 
@@ -75,7 +85,11 @@ def test_schema_mapping_and_failures() -> None:
         clip_test_time(-math.inf)
 
 
-def test_cleaning_reasons_missingness_and_audit(tmp_path: Path, records: list[dict[str, object]], caplog) -> None:
+def test_cleaning_reasons_missingness_and_audit(
+    tmp_path: Path,
+    records: list[dict[str, object]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     records[0]["age"] = "not-a-number"
     records[0]["sex"] = 3
     records[1]["subject#"] = ""
@@ -110,17 +124,48 @@ def test_cleaning_reasons_missingness_and_audit(tmp_path: Path, records: list[di
     assert "malformed_numeric" in caplog.text
     duplicate = next(event for event in events if event["reason"] == "duplicate")
     assert duplicate["duplicate_of"] == 9
-    assert all(row["test_time"] >= 0 or math.isnan(row["test_time"]) for row in rows)
-    assert sum(row["subject"] == 6 and row["test_time"] == 0 for row in rows) == 2
-    assert sum(math.isnan(row["sex"]) for row in rows) == 1
+    assert (rows["test_time"].ge(0) | rows["test_time"].isna()).all()
+    assert (rows["subject"].eq(6) & rows["test_time"].eq(0)).sum() == 2
+    assert rows["sex"].isna().sum() == 1
 
 
 @pytest.mark.parametrize("token", ["", "NA", "N/A", "NaN", "nan", "NULL", "null", " NA "])
 def test_missing_predictors_preserved(tmp_path: Path, records: list[dict[str, object]], token: str) -> None:
     records[0]["PPE"] = token
     rows, _, summary = clean_data(save_raw(tmp_path / "raw.csv", records))
-    assert math.isnan(rows[0]["ppe"])
+    assert math.isnan(rows.iloc[0]["ppe"])
     assert summary["retained_rows"] == len(records)
+
+
+def test_subject_identifiers_are_lossless(tmp_path: Path, records: list[dict[str, object]]) -> None:
+    records[0]["subject#"] = 9007199254740992
+    records[1]["subject#"] = 9007199254740993
+    records[2]["subject#"] = "9007199254740992.1"
+    records[3]["subject#"] = "not-an-id"
+    records[4]["subject#"] = "inf"
+    frame, events, report = clean_data(save_raw(tmp_path / "raw.csv", records))
+    assert isinstance(frame, pd.DataFrame)
+    assert frame.loc[1, "subject"] == 9007199254740992
+    assert frame.loc[2, "subject"] == 9007199254740993
+    assert frame["subject"].nunique() == 12
+    assert {event["reason"] for event in events if event["column"] == "subject"} == {
+        "noninteger_value",
+        "malformed_numeric",
+        "nonfinite_numeric",
+    }
+    assert report["invalid_rows_dropped"] == 3
+    run_prepare(tmp_path, tmp_path / "raw.csv")
+    assignments = pd.read_csv(tmp_path / "processed/split_assignments.csv", dtype={"subject": str})
+    assert {"9007199254740992", "9007199254740993"} <= set(assignments["subject"])
+
+
+def test_empty_dataset_reports_failure(tmp_path: Path) -> None:
+    raw = save_raw(tmp_path / "raw.csv", [])
+    with pytest.raises(ValueError, match="Insufficient patients"):
+        run_prepare(tmp_path, raw)
+    diagnostic = json.loads((tmp_path / "reports/failure.json").read_text())
+    assert diagnostic["summary"]["input_rows"] == 0
+    assert diagnostic["summary"]["retained_rows"] == 0
 
 
 def test_complete_preparation_reproducible_and_disjoint(tmp_path: Path, records: list[dict[str, object]]) -> None:
@@ -133,8 +178,10 @@ def test_complete_preparation_reproducible_and_disjoint(tmp_path: Path, records:
     run_prepare(tmp_path, raw)
     assert snapshot(output) == first
     assert raw.read_bytes() == original
-    train = pd.read_csv(output / "train.csv", float_precision="round_trip")
-    test = pd.read_csv(output / "test.csv", float_precision="round_trip")
+    # Convert exported numeric text directly to floats to check exact round-trip
+    # values without the CSV reader's default floating-point parsing precision.
+    train = pd.read_csv(output / "train.csv", dtype=str).astype(float)
+    test = pd.read_csv(output / "test.csv", dtype=str).astype(float)
     assignments = pd.read_csv(output / "split_assignments.csv")
     assert set(train.subject).isdisjoint(test.subject)
     assert len(train) + len(test) == 24
@@ -153,7 +200,7 @@ def test_complete_preparation_reproducible_and_disjoint(tmp_path: Path, records:
         assert hashlib.sha256(first[name]).hexdigest() == digest
     rows, _, _ = clean_data(raw)
     for frame in (train, test):
-        expected = pd.DataFrame([row for row in rows if row["subject"] in set(frame.subject)])
+        expected = rows.loc[rows["subject"].isin(frame.subject)]
         np.testing.assert_allclose(
             frame[list(CANDIDATE_FEATURES)], expected[list(CANDIDATE_FEATURES)], rtol=0, atol=0, equal_nan=True
         )
@@ -162,18 +209,23 @@ def test_complete_preparation_reproducible_and_disjoint(tmp_path: Path, records:
 
 def test_extremes_only_learn_from_train(tmp_path: Path, records: list[dict[str, object]]) -> None:
     rows, _, _ = clean_data(save_raw(tmp_path / "raw.csv", records))
-    report = extreme_report(rows[:20], rows[20:], 1.5)
-    changed = [dict(row, ppe=1e100) for row in rows[20:]]
-    shifted = extreme_report(rows[:20], changed, 1.5)
-    assert report["ppe"]["lower"] == shifted["ppe"]["lower"]
-    assert report["ppe"]["upper"] == shifted["ppe"]["upper"]
+    report = extreme_report(rows.iloc[:20], rows.iloc[20:], 1.5)
+    changed = rows.iloc[20:].assign(ppe=1e100)
+    shifted = extreme_report(rows.iloc[:20], changed, 1.5)
+    original_bounds = report["ppe"]
+    shifted_bounds = shifted["ppe"]
+    # A skipped check has no bounds. Narrow by status before inspecting limits.
+    assert original_bounds["status"] == "ok"
+    assert shifted_bounds["status"] == "ok"
+    assert original_bounds["lower"] == shifted_bounds["lower"]
+    assert original_bounds["upper"] == shifted_bounds["upper"]
     assert shifted["ppe"]["test_count"] == 4
-    assert extreme_report(rows[:2], [], 1.5)["age"]["status"] == "insufficient_observations"
-    constant = [dict(rows[0]) for _ in range(5)]
+    assert extreme_report(rows.iloc[:2], rows.iloc[:0], 1.5)["age"]["status"] == "insufficient_observations"
+    constant = pd.concat([rows.iloc[:1]] * 5, ignore_index=True)
     assert extreme_report(constant, rows, 1.5)["age"]["status"] == "zero_iqr"
-    overflowing = [dict(rows[0], ppe=value) for value in (-1e308, -1e308, 1e308, 1e308)]
+    overflowing = pd.concat([rows.iloc[:1]] * 4, ignore_index=True).assign(ppe=[-1e308, -1e308, 1e308, 1e308])
     with np.errstate(over="ignore", invalid="ignore"):
-        assert extreme_report(overflowing, [], 1.5)["ppe"]["status"] == "unrepresentable_bounds"
+        assert extreme_report(overflowing, rows.iloc[:0], 1.5)["ppe"]["status"] == "unrepresentable_bounds"
 
 
 @pytest.mark.parametrize(
@@ -192,8 +244,11 @@ def test_extremes_only_learn_from_train(tmp_path: Path, records: list[dict[str, 
     ],
 )
 def test_invalid_parameters(settings: dict[str, object]) -> None:
+    # Intentionally cross the static constructor boundary to test rejection of
+    # malformed runtime inputs; valid application calls retain the typed signature.
+    unchecked_constructor = cast(Callable[..., PrepareConfig], PrepareConfig)
     with pytest.raises(ValueError):
-        PrepareConfig(**settings)
+        unchecked_constructor(**settings)
 
 
 def test_insufficient_data_preserves_outputs_and_diagnostics(tmp_path: Path, records: list[dict[str, object]]) -> None:
@@ -211,7 +266,7 @@ def test_insufficient_data_preserves_outputs_and_diagnostics(tmp_path: Path, rec
     assert failure["summary"]["retained_rows"] == 0
     assert len(failure["events"]) == 24
     with pytest.raises(ValueError, match="Insufficient"):
-        assign_splits([{"subject": 1.0}], PrepareConfig())
+        assign_splits(pd.DataFrame({"subject": [1]}), PrepareConfig())
 
 
 def test_bad_schema_and_csv_produce_failure_reports(tmp_path: Path) -> None:
@@ -221,11 +276,15 @@ def test_bad_schema_and_csv_produce_failure_reports(tmp_path: Path) -> None:
         run_prepare(tmp_path, raw)
     assert json.loads((tmp_path / "reports" / "failure.json").read_text())["summary"] == {"status": "failed"}
     raw.write_text(",".join(RAW_COLUMNS) + '\n"unterminated\n')
-    with pytest.raises(csv.Error):
+    with pytest.raises(pd.errors.ParserError):
         run_prepare(tmp_path, raw)
 
 
-def test_publication_failure_rolls_back(tmp_path: Path, records: list[dict[str, object]], monkeypatch) -> None:
+def test_publication_failure_rolls_back(
+    tmp_path: Path,
+    records: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     raw = save_raw(tmp_path / "raw.csv", records)
     run_prepare(tmp_path, raw)
     before = snapshot(tmp_path / "processed")
@@ -269,13 +328,17 @@ def test_interrupted_publication_reconciled(tmp_path: Path, records: list[dict[s
     assert not (tmp_path / ".processed.previous").exists()
 
 
-def test_raw_change_during_preparation_aborts(tmp_path: Path, records: list[dict[str, object]], monkeypatch) -> None:
+def test_raw_change_during_preparation_aborts(
+    tmp_path: Path,
+    records: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     raw = save_raw(tmp_path / "raw.csv", records)
     original_publish = data.extreme_report
 
-    def change_raw(*args):
+    def change_raw(train: pd.DataFrame, test: pd.DataFrame, multiplier: float) -> ExtremeReport:
         raw.write_text("changed")
-        return original_publish(*args)
+        return original_publish(train, test, multiplier)
 
     monkeypatch.setattr(data, "extreme_report", change_raw)
     with pytest.raises(ValueError, match="Raw data changed"):
@@ -283,7 +346,11 @@ def test_raw_change_during_preparation_aborts(tmp_path: Path, records: list[dict
     assert not (tmp_path / "processed").exists()
 
 
-def test_prepare_entrypoint(tmp_path: Path, records: list[dict[str, object]], monkeypatch) -> None:
+def test_prepare_entrypoint(
+    tmp_path: Path,
+    records: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     save_raw(tmp_path / "data/raw/parkinsons_updrs.csv", records)
     (tmp_path / "params.yaml").write_text("prepare: {seed: 7, validation_folds: 5}\n")
     monkeypatch.chdir(tmp_path)

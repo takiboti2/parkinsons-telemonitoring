@@ -63,6 +63,11 @@ fold count, and descriptive IQR multiplier. Preparation exports `train.csv`,
 `test.csv`, patient/fold assignments, cleaning events, a validation summary, and
 a checksum manifest under `data/processed/`. The raw CSV is never modified.
 Files use the versioned snake_case mapping in `src/parkinsons_ml/schema.py`.
+Preparation reads the raw CSV directly with `pandas.read_csv`, preserving literal
+tokens and the header row for validation before naming columns. Cleaning,
+deduplication, clipping, splits, statistics, and exports operate on DataFrames.
+Truncated records are dropped and audited; unparseable CSV syntax or extra fields
+stop preparation rather than risking silently skipped data.
 `train` is the development pool for grouped validation and refitting; `test` is
 reserved for final assessment, never tuning or promotion.
 
@@ -114,7 +119,7 @@ uv pip check --python .venv/bin/python
 ```
 
 Pytest enforces 95% coverage over `src/` and tests. Hooks format/lint Python, check
-source types, strip notebook outputs, and check file hygiene. Stage new files before
+source and test types, strip notebook outputs, and check file hygiene. Stage new files before
 running `--all-files`; review and restage automatic fixes.
 
 ## Project documents

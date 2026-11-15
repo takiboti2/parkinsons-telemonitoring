@@ -1,12 +1,15 @@
 """Leakage prevention and complete preprocessing pipeline serialization."""
 
 import pickle
+from collections.abc import Callable
+from typing import Literal, cast
 
 import numpy as np
 import pandas as pd
 import pytest
 from sklearn.base import clone
 from sklearn.linear_model import LinearRegression
+from sklearn.pipeline import Pipeline
 
 from parkinsons_ml.schema import CANDIDATE_FEATURES
 from parkinsons_ml.training import FeaturePreparation, build_pipeline
@@ -20,7 +23,10 @@ def features() -> pd.DataFrame:
 
 
 @pytest.mark.parametrize("feature_set", ["baseline", "candidate"])
-def test_pipeline_fit_imputation_and_round_trip(features: pd.DataFrame, feature_set: str) -> None:
+def test_pipeline_fit_imputation_and_round_trip(
+    features: pd.DataFrame,
+    feature_set: Literal["baseline", "candidate"],
+) -> None:
     for name in CANDIDATE_FEATURES[3:]:
         features[name] = [1.0, np.nan, 3.0, 4.0]
     features["motor_updrs"] = [1000.0] * 4
@@ -44,7 +50,9 @@ def test_pipeline_fit_imputation_and_round_trip(features: pd.DataFrame, feature_
     np.testing.assert_allclose(pipeline.predict(changed), predictions)
     assert prepared.shape[1] == (3 if feature_set == "baseline" else 19)
     pd.testing.assert_frame_equal(features, original)
-    clone(pipeline).fit(features, [10.0, 12.0, 14.0, 16.0])
+    cloned = clone(pipeline)
+    assert isinstance(cloned, Pipeline)
+    cloned.fit(features, [10.0, 12.0, 14.0, 16.0])
 
 
 def test_validation_does_not_fit_on_evaluation(features: pd.DataFrame) -> None:
@@ -79,7 +87,10 @@ def test_prediction_validation(features: pd.DataFrame) -> None:
     for frame, message in invalid:
         with pytest.raises(ValueError, match=message):
             transformer.transform(frame)
+    # This deliberately invalid runtime call is the exception to the public
+    # Literal-typed feature-set contract, not a reason to weaken that contract.
+    unchecked_builder = cast(Callable[..., object], build_pipeline)
     with pytest.raises(ValueError, match="feature_set"):
-        build_pipeline("unknown")
+        unchecked_builder("unknown")
     nullable = features.astype("Float64")
     np.testing.assert_allclose(transformer.transform(nullable), transformer.transform(features), equal_nan=True)
