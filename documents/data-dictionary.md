@@ -101,8 +101,11 @@ following are versioned project decisions, not additional claims about UCI data:
   measurements, including those that become equal only after clipping.
 - Clip finite negative `test_time` to zero. Preserve missingness and log the action.
   Apply the same idempotent rule in the serialized model pipeline; reject infinity.
-- Report extreme continuous predictors with train-derived IQR bounds; never remove
-  them. Skip flagging with an explicit status for fewer than four observed train
+- Report extreme continuous predictors with train-derived IQR bounds, flooring
+  each finite lower bound at zero: `max(0, Q1 - multiplier * IQR)`. Upper bounds
+  remain `Q3 + multiplier * IQR`; flag counts use these same reported bounds.
+  Do not clip or remove observations based on these flags. Skip flagging with an
+  explicit status for fewer than four observed train
   values, zero IQR, or unrepresentable bounds. These are not clinical range checks.
 - Export patient-disjoint `train`/`test` data without `total_updrs`; create grouped
   validation folds within train only. Missing continuous predictors use train-fitted

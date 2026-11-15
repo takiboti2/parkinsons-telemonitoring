@@ -332,6 +332,9 @@ def extreme_report(train: pd.DataFrame, test: pd.DataFrame, multiplier: float) -
         if not math.isfinite(lower) or not math.isfinite(upper):
             report[name] = {"status": "unrepresentable_bounds", "train_count": None, "test_count": None}
             continue
+        # The report uses a zero floor for every evaluated numeric feature. This
+        # changes descriptive flags only; observed values and upper bounds stay intact.
+        lower = max(0.0, lower)
         report[name] = {
             "status": "ok",
             "lower": lower,

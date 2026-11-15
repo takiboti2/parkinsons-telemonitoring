@@ -8,7 +8,7 @@ from collections.abc import Sequence
 # Manifests record these identities so consumers can distinguish schema changes
 # from changes to cleaning rules, even when the raw dataset is unchanged.
 SCHEMA_VERSION = "1"
-POLICY_VERSION = "1"
+POLICY_VERSION = "2"
 # Preserve UCI's exact spellings at ingestion; canonical names apply only to
 # derived data and model inputs, never to the original CSV.
 RAW_COLUMNS = (

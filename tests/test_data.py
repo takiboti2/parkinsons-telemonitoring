@@ -228,6 +228,33 @@ def test_extremes_only_learn_from_train(tmp_path: Path, records: list[dict[str, 
         assert extreme_report(overflowing, rows.iloc[:0], 1.5)["ppe"]["status"] == "unrepresentable_bounds"
 
 
+@pytest.mark.parametrize("feature", [name for name in CANDIDATE_FEATURES if name != "sex"])
+@pytest.mark.parametrize("offset, expected_lower", [(0.0, 0.0), (10.0, 9.5)])
+def test_extreme_lower_bound_zero_floor(
+    tmp_path: Path,
+    records: list[dict[str, object]],
+    feature: str,
+    offset: float,
+    expected_lower: float,
+) -> None:
+    rows, _, _ = clean_data(save_raw(tmp_path / "raw.csv", records))
+    train = rows.iloc[:4].copy()
+    train[feature] = np.array([1.0, 2.0, 3.0, 4.0]) + offset
+    upper = 5.5 + offset
+    test = rows.iloc[:5].copy()
+    # Include values on both boundaries: only strictly outside values are flagged.
+    test[feature] = [expected_lower - 0.1, expected_lower, upper, upper + 0.1, np.nan]
+    original_train, original_test = train.copy(deep=True), test.copy(deep=True)
+    bounds = extreme_report(train, test, 1.5)[feature]
+    assert bounds["status"] == "ok"
+    assert bounds["lower"] == expected_lower
+    assert bounds["upper"] == upper
+    assert bounds["train_count"] == 0
+    assert bounds["test_count"] == 2
+    pd.testing.assert_frame_equal(train, original_train)
+    pd.testing.assert_frame_equal(test, original_test)
+
+
 @pytest.mark.parametrize(
     "settings",
     [
