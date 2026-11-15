@@ -5,7 +5,6 @@ import hashlib
 import json
 import logging
 import math
-import os
 import sys
 from collections.abc import Callable
 from pathlib import Path
@@ -14,6 +13,7 @@ from typing import cast
 import numpy as np
 import pandas as pd
 import pytest
+import yaml
 
 from parkinsons_ml import data
 from parkinsons_ml.data import (
@@ -307,7 +307,7 @@ def test_bad_schema_and_csv_produce_failure_reports(tmp_path: Path) -> None:
         run_prepare(tmp_path, raw)
 
 
-def test_publication_failure_rolls_back(
+def test_publication_failure_is_logged_and_rerun_restores_outputs(
     tmp_path: Path,
     records: list[dict[str, object]],
     monkeypatch: pytest.MonkeyPatch,
@@ -315,44 +315,24 @@ def test_publication_failure_rolls_back(
     raw = save_raw(tmp_path / "raw.csv", records)
     run_prepare(tmp_path, raw)
     before = snapshot(tmp_path / "processed")
-    replace = os.replace
 
-    def fail_activation(source: Path, destination: Path) -> None:
-        if source.name == "artifacts":
-            raise OSError("activation failed")
-        replace(source, destination)
+    def fail_publication(source: Path, destination: Path) -> None:
+        raise OSError("publication failed")
 
-    monkeypatch.setattr(data.os, "replace", fail_activation)
-    with pytest.raises(OSError, match="activation failed"):
-        run_prepare(tmp_path, raw)
-    assert snapshot(tmp_path / "processed") == before
+    with monkeypatch.context() as isolated:
+        isolated.setattr(data.os, "replace", fail_publication)
+        with pytest.raises(OSError, match="publication failed"):
+            run_prepare(tmp_path, raw)
+    # Failure after removing the old directory has no rollback guarantee. The
+    # diagnostic records failure, scratch files are cleaned, and rerunning repairs it.
+    assert not (tmp_path / "processed").exists()
     assert not (tmp_path / ".processed.previous").exists()
     assert not list(tmp_path.glob(".processed-*"))
-    monkeypatch.undo()
-    output = tmp_path / "new-output"
-    stage = tmp_path / "stage"
-    stage.mkdir()
-    (stage / "marker").write_text("complete")
-    data.publish(stage, output)
-    assert (output / "marker").read_text() == "complete"
-
-
-@pytest.mark.parametrize("activated", [True, False])
-def test_interrupted_publication_reconciled(tmp_path: Path, records: list[dict[str, object]], activated: bool) -> None:
-    raw = save_raw(tmp_path / "raw.csv", records)
+    failure = json.loads((tmp_path / "reports/failure.json").read_text())
+    assert failure["status"] == "failed"
+    assert failure["error"] == "publication failed"
     run_prepare(tmp_path, raw)
-    output = tmp_path / "processed"
-    before = snapshot(output)
-    output.rename(tmp_path / ".processed.previous")
-    if activated:
-        output.mkdir()
-        for name, content in before.items():
-            (output / name).write_bytes(content)
-    raw.write_text("invalid\n")
-    with pytest.raises(ValueError):
-        run_prepare(tmp_path, raw)
-    assert snapshot(output) == before
-    assert not (tmp_path / ".processed.previous").exists()
+    assert snapshot(tmp_path / "processed") == before
 
 
 def test_raw_change_during_preparation_aborts(
@@ -384,3 +364,127 @@ def test_prepare_entrypoint(
     monkeypatch.setattr(sys, "argv", ["prepare"])
     data.main()
     assert json.loads((tmp_path / "data/processed/manifest.json").read_text())["parameters"]["seed"] == 7
+
+
+@pytest.mark.parametrize(
+    "column, token, reason",
+    [
+        ("age", "60.000000000000001", "noninteger_value"),
+        ("sex", "0.99999999999999999", "invalid_sex"),
+        ("sex", "1e-999", "invalid_sex"),
+    ],
+)
+def test_discrete_values_checked_before_rounding(
+    tmp_path: Path,
+    records: list[dict[str, object]],
+    column: str,
+    token: str,
+    reason: str,
+) -> None:
+    records[0][column] = token
+    records[1]["age"] = "6e1"
+    records[1]["sex"] = "1.00000000000000000000"
+    frame, events, summary = clean_data(save_raw(tmp_path / "raw.csv", records))
+    assert 1 not in frame.index
+    assert 2 in frame.index
+    assert summary["invalid_rows_dropped"] == 1
+    assert {"row": 1, "action": "drop", "reason": reason, "column": column} in events
+
+
+@pytest.mark.parametrize("filename", ["train.csv", "test.csv"])
+def test_staging_csv_failure_preserves_existing_outputs(
+    tmp_path: Path,
+    records: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    filename: str,
+) -> None:
+    raw = save_raw(tmp_path / "raw.csv", records)
+    run_prepare(tmp_path, raw)
+    output = tmp_path / "processed"
+    before = snapshot(output)
+    original_raw = raw.read_bytes()
+    original_write = data.write_csv
+
+    def fail_staging(path: Path, columns: tuple[str, ...], frame: pd.DataFrame) -> None:
+        original_write(path, columns, frame)
+        if path.name == filename:
+            raise OSError("staging write failed")
+
+    monkeypatch.setattr(data, "write_csv", fail_staging)
+    with pytest.raises(OSError, match="staging write failed"):
+        run_prepare(tmp_path, raw)
+    assert snapshot(output) == before
+    assert raw.read_bytes() == original_raw
+    assert not list(tmp_path.glob(".processed-*"))
+    assert json.loads((tmp_path / "reports/failure.json").read_text())["status"] == "failed"
+
+
+def test_staging_manifest_failure_preserves_existing_outputs(
+    tmp_path: Path,
+    records: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    raw = save_raw(tmp_path / "raw.csv", records)
+    run_prepare(tmp_path, raw)
+    output = tmp_path / "processed"
+    before = snapshot(output)
+    records[0]["motor_UPDRS"] = 99
+    save_raw(raw, records)
+    original_write = data.write_json
+
+    def fail_manifest(path: Path, value: object) -> None:
+        original_write(path, value)
+        if path.name == "manifest.json":
+            raise OSError("manifest write failed")
+
+    monkeypatch.setattr(data, "write_json", fail_manifest)
+    with pytest.raises(OSError, match="manifest write failed"):
+        run_prepare(tmp_path, raw)
+    assert snapshot(output) == before
+    assert not list(tmp_path.glob(".processed-*"))
+    assert json.loads((tmp_path / "reports/failure.json").read_text())["status"] == "failed"
+
+
+@pytest.mark.parametrize(
+    "content, error_type",
+    [
+        ("prepare: [", yaml.YAMLError),
+        ("{}", ValueError),
+        ("prepare: []", ValueError),
+        ("prepare: {unknown: 1}", TypeError),
+        ("prepare: {seed: bad}", ValueError),
+        ("prepare: {test_fraction: bad}", ValueError),
+        ("prepare: {test_fraction: true}", ValueError),
+        ("prepare: {validation_folds: 2.5}", ValueError),
+        ("prepare: {extreme_iqr_multiplier: bad}", ValueError),
+        ("prepare: {extreme_iqr_multiplier: true}", ValueError),
+        ("prepare: {extreme_iqr_multiplier: .inf}", ValueError),
+        (None, FileNotFoundError),
+    ],
+)
+def test_cli_configuration_failures_logged_without_touching_outputs(
+    tmp_path: Path,
+    records: list[dict[str, object]],
+    monkeypatch: pytest.MonkeyPatch,
+    content: str | None,
+    error_type: type[Exception],
+) -> None:
+    raw = save_raw(tmp_path / "data/raw/parkinsons_updrs.csv", records)
+    output = tmp_path / "data/processed"
+    failure = tmp_path / "documents/reports/prepare-failure.json"
+    prepare(raw, output, PrepareConfig(), failure)
+    before = snapshot(output)
+    failure.parent.mkdir(parents=True, exist_ok=True)
+    failure.write_text('{"error": "historical"}')
+    if content is not None:
+        (tmp_path / "params.yaml").write_text(content)
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(sys, "argv", ["prepare"])
+    with pytest.raises(error_type):
+        data.main()
+    diagnostic = json.loads(failure.read_text())
+    assert diagnostic["status"] == "failed"
+    assert diagnostic["summary"] == {"status": "failed"}
+    assert diagnostic["events"] == []
+    assert diagnostic["error"] != "historical"
+    assert snapshot(output) == before

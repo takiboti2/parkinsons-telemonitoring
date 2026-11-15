@@ -40,6 +40,10 @@ class FeaturePreparation(TransformerMixin, BaseEstimator):
         # Select and order only approved predictors. Extra target/identifier
         # columns in prepared training tables cannot leak into the estimator.
         frame = X.loc[:, list(self.features)]
+        # Complex columns are numeric to pandas, but casting them to float would
+        # silently discard imaginary components. Reject them before conversion.
+        if any(pd.api.types.is_complex_dtype(frame[name]) for name in self.features):
+            raise ValueError("Prediction features must be real, not complex")
         if any(
             not pd.api.types.is_numeric_dtype(frame[name]) or pd.api.types.is_bool_dtype(frame[name])
             for name in self.features

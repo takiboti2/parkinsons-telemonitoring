@@ -12,7 +12,7 @@
 ## 2. Reproducible data preparation
 
 The single `prepare` stage, canonical schema, cleaning audit, train/test assignments,
-grouped folds, descriptive extreme flags, and safe artifact publication are implemented.
+grouped folds, descriptive extreme flags, and staged artifact publication are implemented.
 See README for commands and the data dictionary for policy. Remaining integration:
 
 - Log preparation reports, the manifest, and split identities with training runs.

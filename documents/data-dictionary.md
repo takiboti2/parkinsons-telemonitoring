@@ -94,6 +94,8 @@ following are versioned project decisions, not additional claims about UCI data:
 - Drop rows with malformed/nonfinite values, missing subject/target, noninteger
   subject or nonmissing age, or sex other than missing/0/1. Warn and record every
   reason. Validate the excluded total score too; missing total score alone is allowed.
+  Check age integrality and sex codes against the original decimal tokens before
+  float conversion, so rounding cannot make invalid values appear valid.
 - Retain missing predictors for fold-fitted imputation. Count explicit missingness
   separately from malformed values. Subject IDs remain grouping/audit information.
 - Remove later exact duplicate copies across all 22 parsed columns before clipping
@@ -111,3 +113,5 @@ following are versioned project decisions, not additional claims about UCI data:
   validation folds within train only. Missing continuous predictors use train-fitted
   medians; missing sex uses the train-fitted mode. An entirely missing fitting
   feature is a training error. Target precision is preserved.
+  Direct model DataFrame inputs must have real numeric dtypes; complex values are
+  rejected rather than cast with their imaginary components discarded.

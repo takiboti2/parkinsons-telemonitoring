@@ -111,11 +111,15 @@ class PrepareConfig:
         # exclude booleans, which Python otherwise treats as integer values.
         if type(self.seed) is not int or not 0 <= self.seed < 2**32:
             raise ValueError("seed must be an integer in [0, 2**32)")
-        if not 0 < self.test_fraction < 1:
+        if type(self.test_fraction) not in (int, float) or not 0 < self.test_fraction < 1:
             raise ValueError("test_fraction must be between zero and one")
         if type(self.validation_folds) is not int or self.validation_folds < 2:
             raise ValueError("validation_folds must be an integer of at least two")
-        if not math.isfinite(self.extreme_iqr_multiplier) or self.extreme_iqr_multiplier <= 0:
+        if (
+            type(self.extreme_iqr_multiplier) not in (int, float)
+            or not math.isfinite(self.extreme_iqr_multiplier)
+            or self.extreme_iqr_multiplier <= 0
+        ):
             raise ValueError("extreme_iqr_multiplier must be positive and finite")
 
 
@@ -225,10 +229,17 @@ def clean_data(raw: Path) -> tuple[pd.DataFrame, list[Event], CleaningSummary]:
         record(malformed, name, "malformed_numeric")
         if name == "motor_updrs":
             record(pd.Series(missing[name], index=tokens.index), name, "missing_required")
-        elif name == "age":
-            record(numeric[name].notna() & ~nonfinite & numeric[name].mod(1).ne(0), name, "noninteger_value")
-        elif name == "sex":
-            record(~missing[name] & ~nonfinite & ~malformed & ~numeric[name].isin([0, 1]), name, "invalid_sex")
+        elif name in ("age", "sex"):
+            # Inspect original tokens: float rounding can turn a fractional age
+            # or a nearly-binary sex code into a valid-looking integer.
+            constrained = ~(missing[name] | nonfinite | malformed)
+            invalid_discrete = pd.Series(False, index=tokens.index)
+            for index, token in zip(tokens.index[constrained], tokens.loc[constrained, name], strict=True):
+                value = Decimal(str(token))
+                invalid_discrete.loc[index] = (
+                    value != value.to_integral_value() if name == "age" else value not in (Decimal(0), Decimal(1))
+                )
+            record(invalid_discrete, name, "noninteger_value" if name == "age" else "invalid_sex")
     valid = numeric.loc[~invalid].copy()
     # Compare all 22 columns before dropping total_updrs or clipping times, so
     # distinct repeated measurements are not mistaken for exact duplicate copies.
@@ -352,23 +363,34 @@ def write_csv(path: Path, columns: tuple[str, ...], rows: pd.DataFrame) -> None:
     rows.reindex(columns=list(columns)).to_csv(path, index=False, na_rep="", lineterminator="\n")
 
 
+def write_failure(
+    path: Path,
+    error: Exception,
+    summary: CleaningSummary | PreparationSummary | None = None,
+    events: list[Event] | None = None,
+) -> None:
+    """Record configuration and preparation failures through the same boundary."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    write_json(
+        path,
+        {
+            "status": "failed",
+            "error": str(error),
+            "summary": {**(summary or {}), "status": "failed"},
+            "events": events or [],
+        },
+    )
+    LOGGER.error("Preparation failed; diagnostics: %s", path)
+
+
 def publish(stage: Path, output: Path) -> None:
-    """Swap complete directories; preserve previous outputs if activation fails."""
-    backup = output.with_name(f".{output.name}.previous")
-    # Renames stay on the same filesystem because staging is beside the output.
-    # Keep the old directory available until the staged directory is activated.
+    """Publish only a fully written artifact set, without persistent rollback state."""
+    # All processing and staging succeeded before this point. Replacing a nonempty
+    # directory requires removing it first; failure in this short final window can
+    # leave outputs missing or incomplete. Rerun preparation or restore with DVC.
     if output.exists():
-        os.replace(output, backup)
-    try:
-        os.replace(stage, output)
-    except OSError:
-        # Restore the old directory when activation itself fails; cleanup after
-        # successful activation is a separate operation below.
-        if backup.exists():
-            os.replace(backup, output)
-        raise
-    if backup.exists():
-        shutil.rmtree(backup)
+        shutil.rmtree(output)
+    os.replace(stage, output)
 
 
 def prepare(raw: Path, output: Path, config: PrepareConfig, failure_report: Path) -> PreparationSummary:
@@ -379,13 +401,6 @@ def prepare(raw: Path, output: Path, config: PrepareConfig, failure_report: Path
     events: list[Event] = []
     try:
         output.parent.mkdir(parents=True, exist_ok=True)
-        backup = output.with_name(f".{output.name}.previous")
-        # Reconcile an interruption between either of the publication renames.
-        if backup.exists():
-            if output.exists():
-                shutil.rmtree(backup)
-            else:
-                os.replace(backup, output)
         raw_hash = checksum(raw)
         rows, events, summary = clean_data(raw)
         assignments = assign_splits(rows, config)
@@ -426,7 +441,13 @@ def prepare(raw: Path, output: Path, config: PrepareConfig, failure_report: Path
         summary = report
         # Build the entire artifact set before publishing any of it. A failed
         # export leaves existing outputs in place and removes temporary files.
-        with tempfile.TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as temporary:
+        # Temporary-directory cleanup must not turn a committed publication into
+        # a reported failure either; leftover scratch files are safe to clean later.
+        with tempfile.TemporaryDirectory(
+            prefix=f".{output.name}-",
+            dir=output.parent,
+            ignore_cleanup_errors=True,
+        ) as temporary:
             stage = Path(temporary) / "artifacts"
             stage.mkdir()
             write_csv(stage / "train.csv", EXPORT_COLUMNS, train)
@@ -466,12 +487,7 @@ def prepare(raw: Path, output: Path, config: PrepareConfig, failure_report: Path
     except (ValueError, OSError) as error:
         # Diagnostics are separate from successful DVC outputs. Re-raise so the
         # caller/DVC sees a failure rather than accepting incomplete preparation.
-        failed_summary = {**(summary or {}), "status": "failed"}
-        failure_report.parent.mkdir(parents=True, exist_ok=True)
-        write_json(
-            failure_report, {"status": "failed", "error": str(error), "summary": failed_summary, "events": events}
-        )
-        LOGGER.error("Preparation failed; diagnostics: %s", failure_report)
+        write_failure(failure_report, error, summary, events)
         raise
     LOGGER.info("Prepared %d train and %d test rows", len(train), len(test))
     return report
@@ -483,15 +499,22 @@ def main() -> None:
     parser.add_argument("--params", type=Path, default=Path("params.yaml"))
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
-    settings = yaml.safe_load(args.params.read_text(encoding="utf-8"))
-    # The CLI reads preparation settings only; it neither downloads replacement
-    # data nor requires a running MLflow server.
-    config = PrepareConfig(**settings["prepare"])
+    failure_report = Path("documents/reports/prepare-failure.json")
+    try:
+        settings = yaml.safe_load(args.params.read_text(encoding="utf-8"))
+        if not isinstance(settings, dict) or not isinstance(settings.get("prepare"), dict):
+            raise ValueError("Parameters must contain a prepare mapping")
+        # Validate configuration inside the diagnostic boundary, including unknown
+        # keys and incorrect runtime types from YAML, before touching active data.
+        config = PrepareConfig(**settings["prepare"])
+    except (OSError, ValueError, TypeError, OverflowError, yaml.YAMLError) as error:
+        write_failure(failure_report, error)
+        raise
     prepare(
         Path("data/raw/parkinsons_updrs.csv"),
         Path("data/processed"),
         config,
-        Path("documents/reports/prepare-failure.json"),
+        failure_report,
     )
 
 

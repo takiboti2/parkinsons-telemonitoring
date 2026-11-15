@@ -27,3 +27,7 @@ htmlcov/
 
 # Keep the implementation plan versioned; exclude disposable generated reports.
 /documents/reports/
+
+
+#workspace settings
+/.vscode

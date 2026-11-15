@@ -94,3 +94,14 @@ def test_prediction_validation(features: pd.DataFrame) -> None:
         unchecked_builder("unknown")
     nullable = features.astype("Float64")
     np.testing.assert_allclose(transformer.transform(nullable), transformer.transform(features), equal_nan=True)
+
+
+@pytest.mark.parametrize("column", CANDIDATE_FEATURES)
+def test_complex_predictors_rejected_before_casting(features: pd.DataFrame, column: str) -> None:
+    for name in CANDIDATE_FEATURES[3:]:
+        features[name] = [1.0, 2.0, 3.0, 4.0]
+    features[column] = [60 + 4j] * len(features)
+    original = features.copy(deep=True)
+    with pytest.raises(ValueError, match="must be real, not complex"):
+        build_pipeline("candidate").fit(features, [1.0, 2.0, 3.0, 4.0])
+    pd.testing.assert_frame_equal(features, original)

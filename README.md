@@ -77,12 +77,19 @@ finite `test_time` is clipped to zero as an explicit project policy, not a sourc
 correction. Extreme-value flags are descriptive only, using train-derived bounds.
 See the [processing policy](documents/data-dictionary.md#project-processing-policy).
 
-Failed preparation preserves the last valid outputs and writes diagnostics to
-`documents/reports/prepare-failure.json`; an older failure report is historical,
-not the status of a later successful run. Successful status is recorded in the
-published validation summary. Preparation is a single-writer operation; do not
-run it concurrently. Files are published together, with interrupted publication
-reconciled on the next invocation.
+Configuration, validation, processing, and staging failures leave existing outputs
+untouched. All artifacts are written to a temporary directory before publication.
+The final step removes the old processed directory and renames the staged directory
+into place. This replacement is not atomic: interruption during it can leave
+outputs missing or incomplete. Treat those outputs as unavailable and rerun
+preparation, or restore a version available in the DVC cache/remote. There is no persistent backup or
+automatic rollback/recovery mechanism; the checksum manifest remains for lineage.
+
+Failures write diagnostics to `documents/reports/prepare-failure.json`; an older
+failure report is historical, not the status of a later successful run. Successful
+status is recorded in the published validation summary, but after a publication
+error an old summary alone is not evidence of complete outputs. Preparation is a
+single-writer operation: do not run it concurrently or consume outputs during it.
 
 `parkinsons_ml.training.build_pipeline("baseline" | "candidate")` creates an
 unfitted pipeline with feature selection, time clipping, median continuous-feature
