@@ -1,0 +1,5 @@
+prepare:
+  seed: 42
+  test_fraction: 0.20
+  validation_folds: 5
+  extreme_iqr_multiplier: 1.5

@@ -4,9 +4,9 @@ Predict `motor_UPDRS` with scikit-learn's `LinearRegression`. The baseline uses
 `age`, `sex`, and `test_time`; the candidate adds 16 voice features. Exclude
 `total_UPDRS` and use `subject#` only for patient-disjoint evaluation.
 
-**Status:** dependencies, hooks, notebook Git tools, and DVC raw-data tracking are
-configured. Data processing, application services, CI, and Docker deployment remain
-to be implemented. This is not a clinical diagnostic service.
+**Status:** dependencies, hooks, notebook Git tools, DVC preparation, and reusable
+model-preprocessing pipelines are implemented. Training orchestration, application
+services, CI, and Docker deployment remain. This is not a clinical diagnostic service.
 
 ## Development setup
 
@@ -49,6 +49,51 @@ uv run --frozen dvc pull
 The override is ignored by Git. A new machine needs a copy of the populated remote;
 Git contains only the dataset pointer. Back up the remote separately. Keep raw data
 unchanged during processing and write derived data to `data/processed/`.
+
+### Prepare train/test data
+
+After `uv sync --frozen` and retrieving the raw dataset:
+
+```bash
+uv run --frozen dvc repro prepare
+```
+
+`params.yaml` controls the patient split seed, test fraction, grouped validation
+fold count, and descriptive IQR multiplier. Preparation exports `train.csv`,
+`test.csv`, patient/fold assignments, cleaning events, a validation summary, and
+a checksum manifest under `data/processed/`. The raw CSV is never modified.
+Files use the versioned snake_case mapping in `src/parkinsons_ml/schema.py`.
+`train` is the development pool for grouped validation and refitting; `test` is
+reserved for final assessment, never tuning or promotion.
+
+Schema errors stop preparation. Invalid rows and duplicate copies are dropped
+with warnings and audited reasons; missing predictors are retained. Negative
+finite `test_time` is clipped to zero as an explicit project policy, not a source
+correction. Extreme-value flags are descriptive only, using train-derived bounds.
+See the [processing policy](documents/data-dictionary.md#project-processing-policy).
+
+Failed preparation preserves the last valid outputs and writes diagnostics to
+`documents/reports/prepare-failure.json`; an older failure report is historical,
+not the status of a later successful run. Successful status is recorded in the
+published validation summary. Preparation is a single-writer operation; do not
+run it concurrently. Files are published together, with interrupted publication
+reconciled on the next invocation.
+
+`parkinsons_ml.training.build_pipeline("baseline" | "candidate")` creates an
+unfitted pipeline with feature selection, time clipping, median continuous-feature
+imputation, most-frequent sex imputation, and `LinearRegression`. Fit it only on
+training partitions. The model rejects an entirely missing fitting feature.
+Preparation does not contact MLflow; future training will log its reports and
+manifest along with the complete model pipeline.
+
+To upload generated datasets (writes to the configured data remote):
+
+```bash
+uv run --frozen dvc push
+```
+
+Review `dvc.lock` alongside code and parameters before committing. The data remote
+and any populated cache must be backed up separately.
 
 ## Notebooks
 

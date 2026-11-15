@@ -2,25 +2,23 @@
 
 ## 1. Establish the application foundation
 
-- Create an installable `src/parkinsons_ml/` package using Python 3.13 and uv's
-  locked dependencies. Start with simple data, training, API, and monitoring modules;
+- The installable `src/parkinsons_ml/` package and data/model preprocessing modules
+  exist. Add API and monitoring modules as those services are implemented;
   add separate configuration/tracking modules only when useful.
 - Define typed settings for MLflow, dataset paths, API authentication, and batch limits.
 - Add one GitHub Actions workflow for hooks, tests, and dependency consistency;
   extend it with Docker/deployment checks as those components are implemented.
 
-## 2. Prepare reproducible data with one DVC stage
+## 2. Reproducible data preparation
 
-- Preserve `data/raw/parkinsons_updrs.csv`. Implement one `prepare` stage that
-  validates, cleans deterministically, and creates patient-disjoint partitions.
-- Validate columns/types, finite values, missing targets/subject IDs, and duplicates.
-  Report cleaning decisions; do not silently discard repeated patient visits.
-- Keep the schema and ordered feature lists in code. Export prepared data and split
-  assignments to `data/processed/`; retain a validation summary for training artifacts.
-- Reserve approximately 20% of patients as a fixed test set. Use five-fold grouped
-  validation within development data, recording the seed and patient assignments.
-- Declare code, data, and parameter dependencies in `dvc.yaml`; commit DVC metadata
-  and push data to the separate filesystem remote. Verify recovery with an empty cache.
+The single `prepare` stage, canonical schema, cleaning audit, train/test assignments,
+grouped folds, descriptive extreme flags, and safe artifact publication are implemented.
+See README for commands and the data dictionary for policy. Remaining integration:
+
+- Log preparation reports, the manifest, and split identities with training runs.
+- Build a versioned, identifier-free pre-imputation monitoring reference from train.
+- Review and commit DVC metadata with code; publish data to the approved remote and
+  verify empty-cache recovery whenever dataset or preparation identities change.
 
 ## 3. Start MLflow as the authoritative store
 
@@ -39,8 +37,9 @@
 | Candidate | `LinearRegression` | Baseline features plus 16 voice measurements |
 
 - Predict `motor_UPDRS`; exclude `total_UPDRS` and `subject#` from model inputs.
-- Build a scikit-learn pipeline containing explicit feature selection, necessary
-  imputation, and the estimator. Fit preprocessing only on each training fold.
+- Reuse `training.build_pipeline` for feature selection, zero-clipping of time,
+  continuous median/sex mode imputation, and the estimator. Fit only on each
+  training fold; use saved train-fold assignments for both feature sets.
 - Compare MAE, RMSE, and R² on identical development folds. Select with development
   MAE, then refit the selected pipeline on development data. Keep the test set out
   of selection/promotion; use it only for final assessment.

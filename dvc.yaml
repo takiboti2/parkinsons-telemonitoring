@@ -1,0 +1,15 @@
+stages:
+  prepare:
+    cmd: uv run --frozen python -m parkinsons_ml.data
+    deps:
+      - data/raw/parkinsons_updrs.csv
+      - src/parkinsons_ml/schema.py
+      - src/parkinsons_ml/data.py
+      - src/parkinsons_ml/__init__.py
+      - pyproject.toml
+      - uv.lock
+    params:
+      - prepare
+    outs:
+      - data/processed:
+          persist: true
