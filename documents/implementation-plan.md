@@ -22,8 +22,11 @@ See README for commands and the data dictionary for policy. Remaining integratio
 
 ## 3. Start MLflow as the authoritative store
 
-- Run MLflow with a persistent SQLite backend and a persistent local artifact volume.
-  Enable HTTP artifact serving so clients need no shared filesystem mounts.
+- Localhost MLflow setup with persistent SQLite metadata and HTTP-served local
+  artifacts is documented in README. Real HTTP artifact/model round-trip,
+  registry, restart, and failure integration tests cover the existing pipelines.
+- Remaining: configure clients in the actual training/API/dashboard paths and
+  migrate the same storage design to persistent Docker volumes during deployment.
 - Use MLflow for training records, model registry, inference batches, and monitoring
   reports. Do not introduce a separate audit database or monitoring API.
 - Tag records with their purpose, dataset/schema identity, and relevant timestamps

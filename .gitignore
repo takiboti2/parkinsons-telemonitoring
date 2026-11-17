@@ -6,6 +6,8 @@ dist/
 wheels/
 *.egg-info
 .env
+# MLflow metadata and artifacts are persisted locally, not committed or DVC-tracked.
+/storage/mlflow/
 # Virtual environments
 .venv
 

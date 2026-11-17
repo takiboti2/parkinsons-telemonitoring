@@ -4,9 +4,9 @@ Predict `motor_UPDRS` with scikit-learn's `LinearRegression`. The baseline uses
 `age`, `sex`, and `test_time`; the candidate adds 16 voice features. Exclude
 `total_UPDRS` and use `subject#` only for patient-disjoint evaluation.
 
-**Status:** dependencies, hooks, notebook Git tools, DVC preparation, and reusable
-model-preprocessing pipelines are implemented. Training orchestration, application
-services, CI, and Docker deployment remain. This is not a clinical diagnostic service.
+**Status:** dependencies, hooks, notebook Git tools, DVC preparation, reusable model
+pipelines, and a local persistent MLflow setup are implemented. Training orchestration,
+FastAPI/Streamlit services, CI, and Docker deployment remain. This is not a clinical diagnostic service.
 
 ## Development setup
 
@@ -106,6 +106,75 @@ uv run --frozen dvc push
 
 Review `dvc.lock` alongside code and parameters before committing. The data remote
 and any populated cache must be backed up separately.
+
+## MLflow tracking server
+
+From the repository root, start the pinned server in a dedicated terminal:
+
+```bash
+./scripts/start_mlflow.sh
+```
+
+The Bash script creates storage directories, runs the frozen uv environment, and
+resolves all paths relative to the repository even when invoked from elsewhere.
+Stop any server already using port 5000 before starting another instance.
+
+Both tracking and registry metadata are explicitly routed to the same SQLite
+database, overriding `MLFLOW_REGISTRY_STORE_URI`. The launcher rejects nonempty
+`MLFLOW_READ_REPLICA_BACKEND_STORE_URI`, `MLFLOW_ARTIFACTS_ONLY`, and
+`MLFLOW_ARTIFACTS_PRESIGNED_ONLY` settings; unset them first (including explicit
+`false` values). Other environment settings are retained.
+
+For isolated tests or another local store, only storage and port are configurable:
+
+```bash
+PARKINSONS_MLFLOW_STORAGE_DIR=/absolute/path/to/mlflow-test \
+PARKINSONS_MLFLOW_PORT=5001 ./scripts/start_mlflow.sh
+```
+
+Relative storage paths resolve against the repository root. Changing the directory
+selects a different database/artifact store; changing the port requires updating
+client URIs. Only the default `storage/mlflow/` location is automatically Git-ignored.
+
+Open <http://127.0.0.1:5000>. When working through Remote SSH, forward port 5000
+instead of exposing the server publicly. This command runs in the foreground;
+stop with Ctrl+C and rerun it to restart against the same persistent store. It is
+not a boot-time service. No authentication is configured: keep it localhost-only.
+
+`storage/mlflow/mlflow.db` contains run/registry metadata and
+`storage/mlflow/artifacts/` contains models and reports. Both are ignored by Git
+and are separate from DVC datasets. Absolute paths prevent working-directory
+changes from selecting a different store. Keep both locations together; for a
+simple consistent backup, stop the server and copy the entire `storage/mlflow/`
+directory before restarting. Do not back up just the database or just artifacts,
+or edit MLflow's internal tables.
+
+In each client terminal, configure the same HTTP server explicitly:
+
+```bash
+export MLFLOW_TRACKING_URI="http://127.0.0.1:5000"
+export MLFLOW_REGISTRY_URI="$MLFLOW_TRACKING_URI"
+```
+
+These exports apply to that shell; `.env` is not automatically loaded by this
+command. The training entry point is not implemented yet. Its future tracking
+configuration must be explicit, without an untracked-training/local-store fallback.
+
+HTTP artifact serving means clients do not need a shared artifact-directory mount.
+New experiments should have `mlflow-artifacts:/...` locations, not server-local
+`file:` paths. Changing server options does not rewrite existing experiments'
+artifact locations. This setup uses one SQLite-backed server and one worker;
+multi-host deployment and high concurrency are outside the project scope.
+
+The default test suite includes real HTTP integration tests for both project
+pipelines, artifact bytes, model registry versions, fresh-process model loading,
+restart persistence, and failure behavior. They start isolated temporary MLflow
+servers through the same launcher with isolated storage/ports; they do not use
+port 5000 or modify this development store. Run the full `uv run --frozen pytest`
+for the normal quality gate, including
+the 95% whole-project coverage requirement. Localhost subprocess/network
+access is required. The tests use separate client/server working directories and
+verify HTTP routing; they do not constitute a container mount-isolation test.
 
 ## Notebooks
 
