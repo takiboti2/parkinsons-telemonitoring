@@ -76,3 +76,42 @@ Except where indicated by the source description or column label, the supplied a
 - If processing introduces canonical column names, maintain a versioned, explicit mapping back to these raw names. This dictionary does not rename the dataset.
 
 See the [implementation plan](implementation-plan.md) for pipeline architecture and acceptance criteria. The system is not a clinical diagnostic service.
+
+## Project processing policy
+
+The raw dictionary above remains authoritative for source interpretation. The
+following are versioned project decisions, not additional claims about UCI data:
+
+- Validate all 22 raw headers before normalization; missing, unexpected, duplicate,
+  or normalization-colliding names are fatal schema errors.
+- Normalize with the notebook's `to_snake_case` convention. The complete mapping is
+  exported in each manifest and defined in `src/parkinsons_ml/schema.py`:
+  `subject#` becomes `subject`, `motor_UPDRS` becomes `motor_updrs`, `Jitter(%)`
+  becomes `jitter`, and `Shimmer(dB)` becomes `shimmer_db`.
+- Accepted missing tokens are empty fields, `NA`, `N/A`, `NaN`, `nan`, `NULL`, and
+  `null`, after trimming whitespace. Other nonnumeric strings are malformed, not
+  missing. Other spellings parsed as NaN or infinity are invalid nonfinite values.
+- Drop rows with malformed/nonfinite values, missing subject/target, noninteger
+  subject or nonmissing age, or sex other than missing/0/1. Warn and record every
+  reason. Validate the excluded total score too; missing total score alone is allowed.
+  Check age integrality and sex codes against the original decimal tokens before
+  float conversion, so rounding cannot make invalid values appear valid.
+- Retain missing predictors for fold-fitted imputation. Count explicit missingness
+  separately from malformed values. Subject IDs remain grouping/audit information.
+- Remove later exact duplicate copies across all 22 parsed columns before clipping
+  or dropping columns. Keep the first in source order. Preserve distinct repeated
+  measurements, including those that become equal only after clipping.
+- Clip finite negative `test_time` to zero. Preserve missingness and log the action.
+  Apply the same idempotent rule in the serialized model pipeline; reject infinity.
+- Report extreme continuous predictors with train-derived IQR bounds, flooring
+  each finite lower bound at zero: `max(0, Q1 - multiplier * IQR)`. Upper bounds
+  remain `Q3 + multiplier * IQR`; flag counts use these same reported bounds.
+  Do not clip or remove observations based on these flags. Skip flagging with an
+  explicit status for fewer than four observed train
+  values, zero IQR, or unrepresentable bounds. These are not clinical range checks.
+- Export patient-disjoint `train`/`test` data without `total_updrs`; create grouped
+  validation folds within train only. Missing continuous predictors use train-fitted
+  medians; missing sex uses the train-fitted mode. An entirely missing fitting
+  feature is a training error. Target precision is preserved.
+  Direct model DataFrame inputs must have real numeric dtypes; complex values are
+  rejected rather than cast with their imaginary components discarded.

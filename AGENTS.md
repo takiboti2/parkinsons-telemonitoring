@@ -10,7 +10,7 @@
 ## Code and dependencies
 
 - Use Python 3.13 and uv. Pin direct dependencies exactly, commit `uv.lock`, and export `requirements.txt` from it. Use frozen installs in development, CI, and Docker.
-- Follow PEP8 with a 120-character line limit and type hints. Require zero Pyright errors in `src/` under the configuration in `pyproject.toml`.
+- Follow PEP8 with a 120-character line limit and type hints. Require zero Pyright errors in `src/` and `tests/` under the configuration in `pyproject.toml`.
 - Keep business logic in `src/parkinsons_ml/` and Streamlit as a thin adapter. Start with simple modules; create packages/directories only as needed.
 - Use SQLite and local files, not additional database/object-storage services. Keep application audit records separate from MLflow's internal tables.
 
@@ -29,7 +29,7 @@
 
 - Test application behavior and concrete integration risks, not standard library functions, tool CLI startup, or test helpers for their own sake.
 - Preserve pytest's default 95% coverage gate across `src/` and tests. Do not narrow coverage or add unjustified exclusions/suppressions. Keep fixture state isolated and restored on failure.
-- Aim for zero Flake8 errors and require zero Pyright errors in source. Use the existing hooks for fast checks; put full tests, coverage, image builds, and deployment smoke tests in CI.
+- Aim for zero Flake8 errors and require zero Pyright errors in source and tests. Use the existing hooks for fast checks; put full tests, coverage, image builds, and deployment smoke tests in CI.
 - Add success/failure tests alongside implemented functionality. Do not add dummy services or notebooks just to produce tests or screenshots.
 
 ## Git and notebooks

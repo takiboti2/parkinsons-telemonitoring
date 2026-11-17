@@ -15,6 +15,8 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline, make_pipeline
 
+from parkinsons_ml.training import build_pipeline
+
 
 @pytest.fixture
 def isolated_mlflow(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[str]:
@@ -91,3 +93,22 @@ def test_evidently_report(tmp_path: Path) -> None:
     output = tmp_path / "drift.html"
     report.save_html(str(output))
     assert output.stat().st_size > 0
+
+
+def test_project_pipeline_mlflow_round_trip(isolated_mlflow: str) -> None:
+    """The actual feature selection/clipping/imputation pipeline survives MLflow."""
+    features = pd.DataFrame(
+        {"age": [50.0, 60.0, np.nan, 80.0], "sex": [0.0, 1.0, np.nan, 0.0], "test_time": [-5.0, 1.0, 2.0, np.nan]}
+    )
+    pipeline = build_pipeline()
+    pipeline.fit(features, [10.0, 12.0, 14.0, 16.0])
+    with mlflow.start_run(experiment_id=isolated_mlflow):
+        info = log_model(
+            pipeline,
+            name="prepared-pipeline",
+            input_example=features,
+            skops_trusted_types=["numpy.dtype", "parkinsons_ml.training.FeaturePreparation"],
+        )
+    loaded = load_model(info.model_uri)
+    assert isinstance(loaded, Pipeline)
+    np.testing.assert_allclose(loaded.predict(features), pipeline.predict(features))

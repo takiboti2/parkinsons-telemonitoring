@@ -1,0 +1,42 @@
+schema: '2.0'
+stages:
+  prepare:
+    cmd: uv run --frozen python -m parkinsons_ml.data
+    deps:
+    - path: data/raw/parkinsons_updrs.csv
+      hash: md5
+      md5: 4f97310e2c9fbeedb72e8a37822fee45
+      size: 911261
+    - path: pyproject.toml
+      hash: md5
+      md5: acb0ddea663f329c33036c55a00145c1
+      size: 1581
+    - path: src/parkinsons_ml/__init__.py
+      hash: md5
+      md5: 9f910a669431d13d63bd68d72a770324
+      size: 72
+    - path: src/parkinsons_ml/data.py
+      hash: md5
+      md5: ca4ba85b6789d6c3745aea234943f5e9
+      size: 23117
+    - path: src/parkinsons_ml/schema.py
+      hash: md5
+      md5: d54b0d57583c29b50ac6fd065e7cdf0a
+      size: 3634
+    - path: uv.lock
+      hash: md5
+      md5: 0f99e73e4a07ff7de720b06bc3177747
+      size: 419052
+    params:
+      params.yaml:
+        prepare:
+          seed: 42
+          test_fraction: 0.2
+          validation_folds: 5
+          extreme_iqr_multiplier: 1.5
+    outs:
+    - path: data/processed
+      hash: md5
+      md5: f1376113e55fa0b3d61f7b96997d647a.dir
+      size: 898166
+      nfiles: 6

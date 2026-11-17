@@ -23,10 +23,10 @@ repos:
         types: [python]
 
       - id: pyright
-        name: Type-check all source code with Pyright
+        name: Type-check source and tests with Pyright
         entry: uv run --frozen pyright
         language: system
-        files: ^src/.*\.pyi?$
+        files: ^((src|tests)/.*\.pyi?$|pyproject\.toml$)
         pass_filenames: false
 
       - id: trailing-whitespace
