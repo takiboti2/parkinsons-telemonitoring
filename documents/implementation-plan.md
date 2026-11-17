@@ -6,8 +6,9 @@
   exist. Add API and monitoring modules as those services are implemented;
   add separate configuration/tracking modules only when useful.
 - Define typed settings for MLflow, dataset paths, API authentication, and batch limits.
-- Add one GitHub Actions workflow for hooks, tests, and dependency consistency;
-  extend it with Docker/deployment checks as those components are implemented.
+- The initial GitHub Actions workflow covers hooks, tests, coverage, lock/export
+  consistency, and dependency compatibility. Verify its first hosted run and enable
+  the required merge check; extend the same workflow with Docker/deployment checks.
 
 ## 2. Reproducible data preparation
 
