@@ -15,6 +15,7 @@ from sklearn.impute import SimpleImputer
 from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline, make_pipeline
 
+from parkinsons_ml.schema import BASELINE_FEATURES
 from parkinsons_ml.training import build_pipeline
 
 
@@ -100,7 +101,7 @@ def test_project_pipeline_mlflow_round_trip(isolated_mlflow: str) -> None:
     features = pd.DataFrame(
         {"age": [50.0, 60.0, np.nan, 80.0], "sex": [0.0, 1.0, np.nan, 0.0], "test_time": [-5.0, 1.0, 2.0, np.nan]}
     )
-    pipeline = build_pipeline()
+    pipeline = build_pipeline(BASELINE_FEATURES)
     pipeline.fit(features, [10.0, 12.0, 14.0, 16.0])
     with mlflow.start_run(experiment_id=isolated_mlflow):
         info = log_model(

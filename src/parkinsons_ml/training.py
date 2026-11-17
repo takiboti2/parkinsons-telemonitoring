@@ -1,6 +1,6 @@
 """Build complete preprocessing pipelines; training orchestration comes later."""
 
-from typing import Literal
+from collections.abc import Sequence
 
 import numpy as np
 import pandas as pd
@@ -12,6 +12,30 @@ from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline
 
 from parkinsons_ml.schema import BASELINE_FEATURES, CANDIDATE_FEATURES, clip_test_time
+
+
+def validate_features(features: object) -> tuple[str, ...]:
+    """Validate a runtime selection and return its canonical alphabetical order."""
+    # Accept ordered inputs so duplicates remain detectable. Strings, sets, and
+    # generators are not supported selections; check types before hashing names.
+    if isinstance(features, (str, bytes)) or not isinstance(features, Sequence):
+        raise ValueError("features must be an ordered sequence of column names, not a string")
+    selected: list[str] = []
+    for name in features:
+        if not isinstance(name, str):
+            raise ValueError("features must contain only string column names")
+        selected.append(name)
+    if not selected:
+        raise ValueError("features must not be empty")
+    duplicates = sorted({name for name in selected if selected.count(name) > 1})
+    if duplicates:
+        raise ValueError(f"Duplicate features: {duplicates}")
+    unknown = sorted(set(selected) - set(CANDIDATE_FEATURES))
+    if unknown:
+        raise ValueError(f"Features outside CANDIDATE_FEATURES: {unknown}")
+    # Sort only after validation: converting to a set would silently hide duplicate
+    # configuration entries. Equivalent lists now have identical saved selections.
+    return tuple(sorted(selected))
 
 
 class FeaturePreparation(TransformerMixin, BaseEstimator):
@@ -26,27 +50,31 @@ class FeaturePreparation(TransformerMixin, BaseEstimator):
         values = self.transform(X)
         # An all-missing fitting feature has no training-derived imputation value.
         # Reject it instead of allowing the imputer to silently drop that column.
-        empty = [name for index, name in enumerate(self.features) if np.isnan(values[:, index]).all()]
+        selected = validate_features(self.features)
+        empty = [name for index, name in enumerate(selected) if np.isnan(values[:, index]).all()]
         if empty:
             raise ValueError(f"Entirely missing fitting features: {empty}")
         return self
 
     def transform(self, X: pd.DataFrame) -> NDArray[np.float64]:
+        # Also validate direct transformer use and sklearn parameter updates;
+        # constructor arguments stay unchanged so cloning remains supported.
+        selected = validate_features(self.features)
         if X.columns.has_duplicates:
             raise ValueError("Duplicate prediction columns")
-        missing = set(self.features) - set(X.columns)
+        missing = set(selected) - set(X.columns)
         if missing:
             raise ValueError(f"Missing prediction features: {sorted(missing)}")
         # Select and order only approved predictors. Extra target/identifier
         # columns in prepared training tables cannot leak into the estimator.
-        frame = X.loc[:, list(self.features)]
+        frame = X.loc[:, list(selected)]
         # Complex columns are numeric to pandas, but casting them to float would
         # silently discard imaginary components. Reject them before conversion.
-        if any(pd.api.types.is_complex_dtype(frame[name]) for name in self.features):
+        if any(pd.api.types.is_complex_dtype(frame[name]) for name in selected):
             raise ValueError("Prediction features must be real, not complex")
         if any(
             not pd.api.types.is_numeric_dtype(frame[name]) or pd.api.types.is_bool_dtype(frame[name])
-            for name in self.features
+            for name in selected
         ):
             raise ValueError("Prediction features must be numeric, not strings or booleans")
         # Work on a copy so clipping cannot mutate a caller's DataFrame. Convert
@@ -56,38 +84,40 @@ class FeaturePreparation(TransformerMixin, BaseEstimator):
             raise ValueError("Infinite prediction values")
         # Missing values are allowed, but observed sex/age values must still obey
         # their encodings. Imputation must not disguise invalid observed values.
-        sex = values[:, self.features.index("sex")]
-        if not np.isin(sex[~np.isnan(sex)], [0.0, 1.0]).all():
-            raise ValueError("Invalid sex encoding")
-        age = values[:, self.features.index("age")]
-        if not np.equal(age[~np.isnan(age)], np.floor(age[~np.isnan(age)])).all():
-            raise ValueError("Noninteger age")
-        index = self.features.index("test_time")
-        # This idempotent rule also runs for standalone serialized-model calls,
-        # keeping inference consistent with the prepared train/test representation.
-        values[:, index] = [clip_test_time(float(value)) for value in values[:, index]]
+        if "sex" in selected:
+            sex = values[:, selected.index("sex")]
+            if not np.isin(sex[~np.isnan(sex)], [0.0, 1.0]).all():
+                raise ValueError("Invalid sex encoding")
+        if "age" in selected:
+            age = values[:, selected.index("age")]
+            if not np.equal(age[~np.isnan(age)], np.floor(age[~np.isnan(age)])).all():
+                raise ValueError("Noninteger age")
+        if "test_time" in selected:
+            index = selected.index("test_time")
+            # This idempotent rule also runs for standalone serialized-model calls,
+            # keeping inference consistent with prepared train/test representation.
+            values[:, index] = [clip_test_time(float(value)) for value in values[:, index]]
         return values
 
 
-def build_pipeline(feature_set: Literal["baseline", "candidate"] = "baseline") -> Pipeline:
+def build_pipeline(features: Sequence[str] = BASELINE_FEATURES) -> Pipeline:
     """Construct an unfitted pipeline suitable for fold fitting and serialization."""
-    if feature_set not in ("baseline", "candidate"):
-        raise ValueError("feature_set must be baseline or candidate")
-    features = BASELINE_FEATURES if feature_set == "baseline" else CANDIDATE_FEATURES
-    numeric = [index for index, name in enumerate(features) if name != "sex"]
+    selected = validate_features(features)
     # Learn continuous medians and the categorical mode separately. A median of
     # binary sex values could otherwise produce the invalid category 0.5.
     imputation = ColumnTransformer(
         [
-            ("continuous", SimpleImputer(strategy="median"), numeric),
-            ("sex", SimpleImputer(strategy="most_frequent"), [features.index("sex")]),
+            (name, SimpleImputer(strategy="most_frequent" if name == "sex" else "median"), [index])
+            for index, name in enumerate(selected)
         ]
     )
     # Return unfitted steps: fold-specific fit calls learn imputation values only
     # from that fold's training patients, and serialization retains every step.
     return Pipeline(
         [
-            ("features", FeaturePreparation(features)),
+            # One imputer per column preserves canonical alphabetical order
+            # through to the estimator, including a sex-only selection.
+            ("features", FeaturePreparation(selected)),
             ("imputation", imputation),
             ("linearregression", LinearRegression()),
         ]

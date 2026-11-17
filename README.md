@@ -91,10 +91,32 @@ status is recorded in the published validation summary, but after a publication
 error an old summary alone is not evidence of complete outputs. Preparation is a
 single-writer operation: do not run it concurrently or consume outputs during it.
 
-`parkinsons_ml.training.build_pipeline("baseline" | "candidate")` creates an
-unfitted pipeline with feature selection, time clipping, median continuous-feature
-imputation, most-frequent sex imputation, and `LinearRegression`. Fit it only on
-training partitions. The model rejects an entirely missing fitting feature.
+`parkinsons_ml.training.build_pipeline(features)` accepts a nonempty ordered list
+or tuple of unique canonical names from `CANDIDATE_FEATURES`. It defaults to
+`BASELINE_FEATURES`; the old `"baseline"`/`"candidate"` string arguments are not
+accepted. For example:
+
+```python
+from parkinsons_ml.schema import BASELINE_FEATURES, CANDIDATE_FEATURES
+from parkinsons_ml.training import build_pipeline
+
+baseline = build_pipeline(BASELINE_FEATURES)
+candidate = build_pipeline(CANDIDATE_FEATURES)
+custom = build_pipeline(["ppe", "sex", "age"])
+```
+
+The unfitted pipeline rejects duplicates, sorts selected names alphabetically,
+snapshots the canonical tuple, and excludes unselected columns. Lists containing
+the same names in different orders therefore build the same feature configuration;
+incoming DataFrame column order does not matter either. Only selected predictors
+are required at fit and prediction time. Selected time is zero-clipped, selected sex uses most-frequent
+imputation, and other selected features use median imputation before
+`LinearRegression`. Fit only on training partitions; an entirely missing selected
+fitting feature is rejected. Rebuild the pipeline to change its selection rather
+than changing the selector alone with `set_params`.
+Rebuild/refit pipelines created under the previous caller-order behaviour before
+reusing them with the new transformer; their fitted coefficients may expect a
+different feature order.
 Preparation does not contact MLflow; future training will log its reports and
 manifest along with the complete model pipeline.
 

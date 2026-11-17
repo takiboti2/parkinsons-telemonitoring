@@ -70,6 +70,7 @@ Except where indicated by the source description or column label, the supplied a
 - Predict `motor_UPDRS`; exclude `total_UPDRS` to avoid using a related clinical score as an input.
 - Split and cross-validate by `subject#` so the same subject cannot occur in both fitting and evaluation partitions. Remove the identifier before fitting the estimator.
 - The `LinearRegression` baseline uses only `age`, `sex`, and `test_time`. The full-feature `LinearRegression` candidate adds all 16 voice attributes for 19 predictors total.
+- The model builder also supports subsets of those 19 canonical predictor names, supplied as lists/tuples with duplicates rejected. These do not change the prepared dataset or replace the required baseline/full-candidate comparison. Each pipeline selects and imputes only its configured predictors in canonical alphabetical order, regardless of the supplied order.
 - Do not assume repeated subject identifiers or repeated measurements are duplicate errors.
 - Do not infer permissible ranges from names alone, such as requiring nonnegative `test_time` without checking source documentation.
 - Define missing-value handling and schema validation explicitly in the processing pipeline. Fit learned preprocessing only on training partitions.

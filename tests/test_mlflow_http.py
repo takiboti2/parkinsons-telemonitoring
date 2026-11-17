@@ -10,7 +10,6 @@ import time
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Literal
 
 import httpx
 import mlflow
@@ -23,8 +22,8 @@ from mlflow.sklearn import log_model
 from mlflow.tracking.fluent import ActiveModelContext
 from mlflow.utils.thread_utils import ThreadLocalVariable
 
-from parkinsons_ml.schema import CANDIDATE_FEATURES
-from parkinsons_ml.training import build_pipeline
+from parkinsons_ml.schema import BASELINE_FEATURES, CANDIDATE_FEATURES
+from parkinsons_ml.training import FeaturePreparation, build_pipeline
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -121,11 +120,19 @@ def free_port() -> int:
         return int(connection.getsockname()[1])
 
 
-@pytest.mark.parametrize("feature_set", ["baseline", "candidate"])
+@pytest.mark.parametrize(
+    "feature_set, selected",
+    [
+        ("baseline", BASELINE_FEATURES),
+        ("candidate", CANDIDATE_FEATURES),
+        ("voice_subset", ("ppe", "jitter")),
+    ],
+)
 def test_http_artifact_model_and_registry_survive_restart(
     tmp_path: Path,
     http_tracking_state: None,
-    feature_set: Literal["baseline", "candidate"],
+    feature_set: str,
+    selected: tuple[str, ...],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     store = tmp_path / "server"
@@ -139,10 +146,13 @@ def test_http_artifact_model_and_registry_survive_restart(
             "test_time": [-5.0, 1.0, 2.0, np.nan],
         }
     )
-    if feature_set == "candidate":
-        for name in CANDIDATE_FEATURES[3:]:
-            features[name] = [1.0, np.nan, 3.0, 4.0]
-    pipeline = build_pipeline(feature_set)
+    for name in CANDIDATE_FEATURES[3:]:
+        features[name] = [1.0, np.nan, 3.0, 4.0]
+    pipeline = build_pipeline(selected)
+    selection_step = pipeline.named_steps["features"]
+    assert isinstance(selection_step, FeaturePreparation)
+    canonical = selection_step.features
+    assert canonical == tuple(sorted(selected))
     pipeline.fit(features, [10.0, 12.0, 14.0, 16.0])
     expected = pipeline.predict(features)
     report_bytes = b'{"schema_version":"1","purpose":"http-integration"}\n'
@@ -156,12 +166,13 @@ def test_http_artifact_model_and_registry_survive_restart(
         experiment_id = mlflow.create_experiment("http-models", tags={"purpose": "integration-test"})
         with mlflow.start_run(experiment_id=experiment_id, tags={"purpose": "integration-test"}) as run:
             mlflow.log_param("feature_set", feature_set)
+            mlflow.log_param("features", json.dumps(list(canonical)))
             mlflow.log_metric("mae", float(np.mean(np.abs(expected - [10.0, 12.0, 14.0, 16.0]))))
             mlflow.log_artifact(str(report))
             info = log_model(
                 pipeline,
                 name="pipeline",
-                input_example=features,
+                input_example=features.loc[:, list(canonical)],
                 code_paths=[str(PROJECT_ROOT / "src/parkinsons_ml")],
                 skops_trusted_types=["numpy.dtype", "parkinsons_ml.training.FeaturePreparation"],
             )
@@ -187,18 +198,22 @@ def test_http_artifact_model_and_registry_survive_restart(
         persisted = client.get_run(run.info.run_id)
         assert persisted.info.status == "FINISHED"
         assert persisted.data.params["feature_set"] == feature_set
+        assert json.loads(persisted.data.params["features"]) == list(canonical)
         assert np.isfinite(persisted.data.metrics["mae"])
         assert persisted.data.tags["purpose"] == "integration-test"
         downloaded = client.download_artifacts(run.info.run_id, report.name, str(client_directory))
         assert Path(downloaded).read_bytes() == report_bytes
         assert info.model_id is not None
         assert client.get_logged_model(info.model_id).artifact_location.startswith("mlflow-artifacts:/")
-        assert get_model_info(model_uri).signature is not None
+        signature = get_model_info(model_uri).signature
+        assert signature is not None
+        assert signature.inputs is not None
+        assert signature.inputs.input_names() == list(canonical)
         # Use a fresh interpreter and a different working directory to catch
         # dependence on fluent state or the server's current working directory.
         environment = dict(os.environ, MLFLOW_TRACKING_URI=uri, MLFLOW_REGISTRY_URI=uri)
         environment.pop("PYTHONPATH", None)
-        payload = features.to_json(orient="split")
+        payload = features.loc[:, list(canonical)].to_json(orient="split")
         assert isinstance(payload, str)
         result = subprocess.run(
             [

@@ -43,6 +43,10 @@ See README for commands and the data dictionary for policy. Remaining integratio
 - Reuse `training.build_pipeline` for feature selection, zero-clipping of time,
   continuous median/sex mode imputation, and the estimator. Fit only on each
   training fold; use saved train-fold assignments for both feature sets.
+- Pass explicit feature lists (`BASELINE_FEATURES`, `CANDIDATE_FEATURES`,
+  or additional validated subsets). Reject duplicates and canonicalize names
+  alphabetically. Log the canonical selection and use only selected
+  columns in model input examples/signatures, not unrelated columns from train.
 - Compare MAE, RMSE, and R² on identical development folds. Select with development
   MAE, then refit the selected pipeline on development data. Keep the test set out
   of selection/promotion; use it only for final assessment.

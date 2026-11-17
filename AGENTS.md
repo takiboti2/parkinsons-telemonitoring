@@ -18,7 +18,7 @@
 
 - Preserve `data/raw/parkinsons_updrs.csv`; write derived data to `data/processed/`. Track datasets with DVC and metadata/configuration with Git.
 - Predict `motor_UPDRS`. Never use `total_UPDRS`, the target, or `subject#` as predictors; use the subject identifier only for grouping/auditing.
-- Every fitted estimator must be scikit-learn's `LinearRegression`. Baseline features are `age`, `sex`, and `test_time`; the candidate adds all 16 voice features.
+- Every fitted estimator must be scikit-learn's `LinearRegression`. Required comparisons are the `age`, `sex`, and `test_time` baseline and the full candidate adding all 16 voice features. Additional selections may use nonempty, unique subsets of the canonical `CANDIDATE_FEATURES` names; keep selection inside the serialized pipeline.
 - Use identical patient-disjoint development/test assignments and grouped validation folds for comparisons. Keep the final test set out of tuning and promotion.
 - Validate schema, invalid values, missing targets, and duplicates explicitly. Fit learned preprocessing only on training partitions, inside the serialized estimator pipeline.
 - Track lineage, parameters, metrics, reports, model signature, and complete pipelines in MLflow. Save artifacts for both training and prediction; log requests/predictions without unnecessary identifiers.
