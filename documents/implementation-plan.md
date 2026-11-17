@@ -13,9 +13,10 @@
 
 The single `prepare` stage, canonical schema, cleaning audit, train/test assignments,
 grouped folds, descriptive extreme flags, and staged artifact publication are implemented.
-Training now logs preparation reports/identities and selected-feature monitoring
-references. See README for commands and the data dictionary for policy. Remaining:
+See README for commands and the data dictionary for policy. Remaining integration:
 
+- Log preparation reports, the manifest, and split identities with training runs.
+- Build a versioned, identifier-free pre-imputation monitoring reference from train.
 - Review and commit DVC metadata with code; publish data to the approved remote and
   verify empty-cache recovery whenever dataset or preparation identities change.
 
@@ -24,26 +25,34 @@ references. See README for commands and the data dictionary for policy. Remainin
 - Localhost MLflow setup with persistent SQLite metadata and HTTP-served local
   artifacts is documented in README. Real HTTP artifact/model round-trip,
   registry, restart, and failure integration tests cover the existing pipelines.
-- Remaining: configure clients in the API/dashboard paths and
+- Remaining: configure clients in the actual training/API/dashboard paths and
   migrate the same storage design to persistent Docker volumes during deployment.
 - Use MLflow for training records, model registry, inference batches, and monitoring
   reports. Do not introduce a separate audit database or monitoring API.
 - Tag records with their purpose, dataset/schema identity, and relevant timestamps
   so training, inference, and monitoring runs can be queried separately.
 
-## 4. Integrate the shared experimentation function
+## 4. Implement one shared training function
 
-The synchronous `training.run_experiment` and module CLI implement saved-fold
-comparison, pooled out-of-fold selection, all-configuration refits, HTTP MLflow
-logging/reload checks, and typed results. See README for configuration and policy.
+| Experiment | Estimator | Features |
+| --- | --- | --- |
+| Baseline | `LinearRegression` | `age`, `sex`, `test_time` |
+| Candidate | `LinearRegression` | Baseline features plus 16 voice measurements |
 
-- Reuse this function from `/train` and bootstrap without invoking the CLI.
-- Define explicit build provenance before supporting training from installed wheels
-  or deployment images without their own Git source checkout.
-- Implement a separate final-test assessment operation; keep test data out of
-  experimentation, tuning, and promotion decisions.
-- Capture genuine development-system run evidence when running real-data experiments;
-  integration tests use generated datasets and temporary tracking servers.
+- Predict `motor_UPDRS`; exclude `total_UPDRS` and `subject#` from model inputs.
+- Reuse `training.build_pipeline` for feature selection, zero-clipping of time,
+  continuous median/sex mode imputation, and the estimator. Fit only on each
+  training fold; use saved train-fold assignments for both feature sets.
+- Pass explicit feature lists (`BASELINE_FEATURES`, `CANDIDATE_FEATURES`,
+  or additional validated subsets). Reject duplicates and canonicalize names
+  alphabetically. Log the canonical selection and use only selected
+  columns in model input examples/signatures, not unrelated columns from train.
+- Compare MAE, RMSE, and R² on identical development folds. Select with development
+  MAE, then refit the selected pipeline on development data. Keep the test set out
+  of selection/promotion; use it only for final assessment.
+- Log both experiments, code/data/split identities, parameters, validation summary,
+  metrics, pipeline artifacts, input examples, and model signatures in MLflow.
+- Reuse this function from `/train` and bootstrap; add only a thin CLI if needed.
 
 ## 5. Use one champion alias for guarded deployment
 

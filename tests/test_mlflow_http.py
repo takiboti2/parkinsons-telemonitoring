@@ -18,13 +18,12 @@ import pandas as pd
 import pytest
 from mlflow.exceptions import MlflowException
 from mlflow.models import get_model_info
-from mlflow.sklearn import load_model, log_model
+from mlflow.sklearn import log_model
 from mlflow.tracking.fluent import ActiveModelContext
 from mlflow.utils.thread_utils import ThreadLocalVariable
 
 from parkinsons_ml.schema import BASELINE_FEATURES, CANDIDATE_FEATURES
 from parkinsons_ml.training import FeaturePreparation, build_pipeline
-from parkinsons_ml import training
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -119,138 +118,6 @@ def free_port() -> int:
     with socket.socket() as connection:
         connection.bind(("127.0.0.1", 0))
         return int(connection.getsockname()[1])
-
-
-def test_training_comparison_http(
-    tmp_path: Path,
-    prepared_directory: Path,
-    http_tracking_state: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = training.training_config(
-        {"experiment_name": "comparison", "extra_feature_sets": {"voice": ["ppe", "sex"]}}
-    )
-    store, port = tmp_path / "server", free_port()
-    original_read = Path.read_bytes
-
-    def read(path: Path) -> bytes:
-        assert path.name != "test.csv"
-        return original_read(path)
-
-    monkeypatch.setattr(Path, "read_bytes", read)
-    with running_server(store, port) as uri:
-        previous_uris = mlflow.get_tracking_uri(), mlflow.get_registry_uri()
-        previous_environment = {key: os.environ.get(key) for key in ("MLFLOW_TRACKING_URI", "MLFLOW_REGISTRY_URI")}
-        result = training.run_experiment(config, prepared_directory, uri)
-        assert (mlflow.get_tracking_uri(), mlflow.get_registry_uri()) == previous_uris
-        assert {key: os.environ.get(key) for key in previous_environment} == previous_environment
-        client = mlflow.MlflowClient(tracking_uri=uri)
-        client.create_experiment("unsafe-artifacts", artifact_location=str(tmp_path / "unsafe"))
-        with pytest.raises(ValueError, match="HTTP-served"):
-            training.run_experiment(
-                training.training_config({"experiment_name": "unsafe-artifacts"}), prepared_directory, uri
-            )
-        assert client.search_registered_models() == []
-        parent = client.get_run(result.run_id)
-        assert parent.info.status == "FINISHED"
-        assert parent.data.tags["winner"] == result.winner.name
-        assert parent.data.tags["dataset_id"] == result.dataset_id
-        assert len(result.configurations) == 3
-        for child in result.configurations:
-            run = client.get_run(child.run_id)
-            assert run.info.status == "FINISHED"
-            assert run.data.tags["mlflow.parentRunId"] == result.run_id
-            assert json.loads(run.data.params["features"]) == list(child.features)
-            assert run.data.metrics["oof_mae"] == child.metrics.mae
-            assert len(client.get_metric_history(child.run_id, "validation_mae")) == 3
-            parameters = json.loads(
-                Path(client.download_artifacts(child.run_id, "pipeline_parameters.json", str(tmp_path))).read_text()
-            )
-            assert parameters["estimator"]["class"] == "LinearRegression"
-            assert parameters["estimator"]["parameters"] == training.LinearRegression().get_params(deep=False)
-            assert parameters["preprocessing"] == {
-                "features": list(child.features),
-                "continuous_imputation": "median",
-                "sex_imputation": "most_frequent",
-                "test_time": "zero_clip",
-            }
-            reference = client.download_artifacts(child.run_id, "monitoring/reference.csv", str(tmp_path))
-            frame = pd.read_csv(reference)
-            assert tuple(frame.columns) == child.features
-            identity = json.loads(
-                Path(client.download_artifacts(child.run_id, "monitoring/identity.json", str(tmp_path))).read_text()
-            )
-            assert training.digest(Path(reference).read_bytes()) == identity["sha256"]
-            predictions = pd.read_csv(client.download_artifacts(child.run_id, "predictions/oof.csv", str(tmp_path)))
-            assert set(predictions.columns) == {"measurement", "fold", "actual", "prediction"}
-            assert len(predictions) == 18
-        assert mlflow.active_run() is None
-    with running_server(store, port) as uri:
-        mlflow.set_tracking_uri(uri)
-        mlflow.set_registry_uri(uri)
-        model = load_model(result.winner.model_uri)
-        assert model is not None
-        frame = training.load_training_snapshot(prepared_directory).train
-        assert np.isfinite(model.predict(frame)).all()
-        assert mlflow.MlflowClient().get_run(result.run_id).info.status == "FINISHED"
-
-
-def test_training_failures_do_not_select_partial_winner(
-    tmp_path: Path,
-    prepared_directory: Path,
-    http_tracking_state: None,
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    config = training.training_config({"experiment_name": "failures"})
-    with running_server(tmp_path / "server", free_port()) as uri:
-        client = mlflow.MlflowClient(tracking_uri=uri)
-
-        def fail(*args: object, **kwargs: object) -> None:
-            raise RuntimeError("required operation failed")
-
-        def invalid_reload(uri: str) -> None:
-            return None
-
-        for operation in ("evaluate", "log_model", "load_model", "log_metrics", "log_text", "fit", "invalid_reload"):
-            with monkeypatch.context() as patch:
-                if operation == "invalid_reload":
-                    patch.setattr(training, "load_model", invalid_reload)
-                elif operation == "fit":
-                    patch.setattr(training.LinearRegression, "fit", fail)
-                else:
-                    target = mlflow if operation in {"log_metrics", "log_text"} else training
-                    patch.setattr(target, operation, fail)
-                with pytest.raises((RuntimeError, ValueError)):
-                    training.run_experiment(config, prepared_directory, uri)
-            assert mlflow.active_run() is None
-        experiment = client.get_experiment_by_name("failures")
-        assert experiment is not None
-        runs = client.search_runs([experiment.experiment_id])
-        assert all(run.info.status == "FAILED" and "winner" not in run.data.tags for run in runs)
-        evaluate = training.evaluate
-
-        def fail_second(snapshot: training.TrainingSnapshot, features: tuple[str, ...]) -> training.Evaluation:
-            if len(features) > 3:
-                raise RuntimeError("second configuration failed")
-            return evaluate(snapshot, features)
-
-        with monkeypatch.context() as patch:
-            patch.setattr(training, "evaluate", fail_second)
-            with pytest.raises(RuntimeError, match="second configuration"):
-                training.run_experiment(config, prepared_directory, uri)
-        runs = client.search_runs([experiment.experiment_id])
-        assert any(run.info.status == "FINISHED" for run in runs)
-        assert all("winner" not in run.data.tags for run in runs)
-        # A validation error is recorded in a failed parent, before children exist.
-        (prepared_directory / "train.csv").write_text("broken")
-        with pytest.raises(ValueError, match="checksum"):
-            training.run_experiment(config, prepared_directory, uri)
-        # Caller-owned runs must remain active and unmodified.
-        mlflow.set_tracking_uri(uri)
-        with mlflow.start_run(experiment_id=experiment.experiment_id) as caller:
-            with pytest.raises(ValueError, match="unrelated"):
-                training.run_experiment(config, prepared_directory, uri)
-            assert mlflow.active_run() is caller
 
 
 @pytest.mark.parametrize(
