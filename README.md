@@ -5,8 +5,8 @@ Predict `motor_UPDRS` with scikit-learn's `LinearRegression`. The baseline uses
 `total_UPDRS` and use `subject#` only for patient-disjoint evaluation.
 
 **Status:** dependencies, hooks, notebook Git tools, DVC preparation, reusable model
-pipelines, and a local persistent MLflow setup are implemented. Training orchestration,
-FastAPI/Streamlit services, CI, and Docker deployment remain. This is not a clinical diagnostic service.
+pipelines, a local persistent MLflow setup, and CI checks are configured. Training orchestration,
+FastAPI/Streamlit services and Docker deployment remain. This is not a clinical diagnostic service.
 
 ## Development setup
 
@@ -219,6 +219,24 @@ uv pip check --python .venv/bin/python
 Pytest enforces 95% coverage over `src/` and tests. Hooks format/lint Python, check
 source and test types, strip notebook outputs, and check file hygiene. Stage new files before
 running `--all-files`; review and restage automatic fixes.
+
+### Continuous integration
+
+`.github/workflows/ci.yml` runs on pull requests, pushes to `main`, and manual
+dispatch. Its single Ubuntu job uses Python 3.13 and pinned uv/actions to check
+lockfile consistency, frozen installation, dependency compatibility, the requirements
+export, all pre-commit hooks, and the full pytest suite with the existing 95%
+coverage gate. Hook fixes or a stale export fail CI; the workflow does not commit fixes.
+
+Tests use generated data and isolated temporary MLflow servers, so CI needs neither
+the sibling DVC remote nor a development tracking server or project secrets.
+Docker builds and deployment smoke tests will extend this same workflow later.
+
+After the first successful GitHub run, configure the repository's `main` branch
+protection/ruleset to require the **Quality gates** status check before merging.
+The workflow file alone does not enable that enforcement. A manual dispatch is
+available after the workflow exists on the default branch. For a first feature
+branch, open a pull request to exercise it before merging.
 
 ## Project documents
 
