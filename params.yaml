@@ -3,3 +3,6 @@ prepare:
   test_fraction: 0.20
   validation_folds: 5
   extreme_iqr_multiplier: 1.5
+train:
+  experiment_name: motor-updrs-training
+  extra_feature_sets: {}

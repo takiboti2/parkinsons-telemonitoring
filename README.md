@@ -5,8 +5,9 @@ Predict `motor_UPDRS` with scikit-learn's `LinearRegression`. The baseline uses
 `total_UPDRS` and use `subject#` only for patient-disjoint evaluation.
 
 **Status:** dependencies, hooks, notebook Git tools, DVC preparation, reusable model
-pipelines, a local persistent MLflow setup, and CI checks are configured. Training orchestration,
-FastAPI/Streamlit services and Docker deployment remain. This is not a clinical diagnostic service.
+pipelines, MLflow-tracked experimentation, a local persistent MLflow setup, and CI
+are implemented. FastAPI/Streamlit services and Docker deployment remain.
+This is not a clinical diagnostic service.
 
 ## Development setup
 
@@ -117,7 +118,7 @@ than changing the selector alone with `set_params`.
 Rebuild/refit pipelines created under the previous caller-order behaviour before
 reusing them with the new transformer; their fitted coefficients may expect a
 different feature order.
-Preparation does not contact MLflow; future training will log its reports and
+Preparation does not contact MLflow; experimentation logs its reports and
 manifest along with the complete model pipeline.
 
 To upload generated datasets (writes to the configured data remote):
@@ -128,6 +129,98 @@ uv run --frozen dvc push
 
 Review `dvc.lock` alongside code and parameters before committing. The data remote
 and any populated cache must be backed up separately.
+
+## Training and experimentation
+
+Start MLflow as described below, then run from the repository root:
+
+```bash
+export MLFLOW_TRACKING_URI="http://127.0.0.1:5000"
+uv run --frozen python -m parkinsons_ml.training
+```
+
+An explicit HTTP/HTTPS URI is required; no filesystem fallback is used. Plain HTTP
+is accepted only for `localhost` or loopback IP addresses (including IPv6 `::1`);
+remote hosts require HTTPS and appropriately configured server access control.
+Tracking and model loading use that same server. The CLI prints a JSON result with
+parent and child run IDs, model URIs, validation metrics, identities, and the winner.
+`--params` and `--data` override the parameter file and prepared directory.
+Run one comparison at a time, never concurrently with preparation or inside an
+existing MLflow run.
+
+The implementation is split by responsibility:
+
+| Module | Responsibility |
+| --- | --- |
+| `src/parkinsons_ml/training.py` | Feature validation, serialized `FeaturePreparation`, pipeline construction |
+| `src/parkinsons_ml/experimentation.py` | Configuration, prepared snapshot validation, grouped evaluation, metrics, result types |
+| `src/parkinsons_ml/tracking.py` | MLflow orchestration, artifacts, lineage, repository checks, CLI |
+
+For Python callers, use the owning modules directly:
+
+```python
+from pathlib import Path
+
+from parkinsons_ml.experimentation import training_config
+from parkinsons_ml.tracking import run_experiment
+
+config = training_config({"experiment_name": "motor-updrs-training"})
+result = run_experiment(config, Path("data/processed"), "http://127.0.0.1:5000")
+```
+
+The previous `training.training_config()` and `training.run_experiment()` entry
+points remain as thin delegates, as does the documented training command.
+`python -m parkinsons_ml.tracking` also invokes the CLI. The transformer retains
+its `parkinsons_ml.training.FeaturePreparation` import path for saved models.
+Pipeline construction and evaluation do not import MLflow; tracking is the outer layer.
+
+Experimentation is deliberately **source-checkout-only**, not supported from an
+installed wheel. Git must be available, and the package must reside under its own
+Git checkout's `src/parkinsons_ml/`, alongside `uv.lock` and `pyproject.toml` at the
+repository root. These requirements are checked before contacting MLflow or creating
+runs, independently of the caller's working directory. For packaged deployment,
+explicit build provenance remains future work; no missing Git metadata is silently ignored.
+
+`params.yaml` always adds the baseline and full candidate. Optional configurations
+extend them, for example:
+
+```yaml
+train:
+  experiment_name: motor-updrs-training
+  extra_feature_sets:
+    voice_subset: [jitter, ppe]
+```
+
+Names must be lowercase identifiers (letters, digits, `_`, `-`, starting with a
+letter; at most 64 characters). Reserved names, duplicate YAML keys, duplicate
+features, unknown features/keys, and canonically redundant selections are rejected.
+Training settings do not invalidate DVC's preparation stage.
+
+The loop verifies artifact checksums, schema/policy, summary counts, patient
+assignments, and saved folds before fitting. It snapshots training inputs with
+pandas and **never opens `test.csv`**, including for checksum verification. Invalid
+inputs fail rather than being cleaned again or triggering preparation.
+
+Selection uses pooled, measurement-weighted out-of-fold MAE on identical saved
+patient folds. Exact ties prefer baseline, then fewer features, then name.
+Per-fold/pooled MAE, RMSE, R², fold means/population standard deviations, and
+counts are logged. Undefined R² is `null` with a reason in reports and is omitted
+from scalar metrics. Fold R² means/standard deviations are null if any fold R²
+is undefined; pooled R² is calculated independently.
+
+One parent comparison run contains one child per configuration. Every child
+refits on all train data, logs and reload-verifies a complete pipeline, and saves
+selected-feature-only signatures/examples, identifier-free prediction artifacts,
+and a checksummed pre-imputation monitoring reference. The parent records
+preparation/audit metadata separately, code/dependency hashes, Git revision/dirty
+status, comparison results, and selection. It does not upload the full training
+table or arbitrary working-tree files.
+
+Required fit, prediction, logging, artifact upload, or reload errors fail the
+comparison; completed children can remain for diagnosis but cannot yield a partial
+winner. MLflow context managers mark failed runs when the server is reachable;
+an outage can leave remote status uncertain. There is no retry/resume or automatic
+promotion. Final-test assessment and registry/`champion` changes are separate work.
 
 ## MLflow tracking server
 
@@ -178,9 +271,9 @@ export MLFLOW_TRACKING_URI="http://127.0.0.1:5000"
 export MLFLOW_REGISTRY_URI="$MLFLOW_TRACKING_URI"
 ```
 
-These exports apply to that shell; `.env` is not automatically loaded by this
-command. The training entry point is not implemented yet. Its future tracking
-configuration must be explicit, without an untracked-training/local-store fallback.
+These exports apply to that shell; `.env` is not automatically loaded. Training
+requires an explicit tracking URI and uses that same server for model loading;
+there is no untracked-training/local-store fallback.
 
 HTTP artifact serving means clients do not need a shared artifact-directory mount.
 New experiments should have `mlflow-artifacts:/...` locations, not server-local

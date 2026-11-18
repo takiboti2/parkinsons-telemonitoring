@@ -1,6 +1,8 @@
-"""Build complete preprocessing pipelines; training orchestration comes later."""
+"""Build complete preprocessing pipelines and retain legacy training entry points."""
 
 from collections.abc import Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
@@ -12,6 +14,9 @@ from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline
 
 from parkinsons_ml.schema import BASELINE_FEATURES, CANDIDATE_FEATURES, clip_test_time
+
+if TYPE_CHECKING:
+    from parkinsons_ml.experimentation import ComparisonResult, TrainConfig
 
 
 def validate_features(features: object) -> tuple[str, ...]:
@@ -122,3 +127,31 @@ def build_pipeline(features: Sequence[str] = BASELINE_FEATURES) -> Pipeline:
             ("linearregression", LinearRegression()),
         ]
     )
+
+
+def training_config(value: object) -> "TrainConfig":
+    """Compatibility entry point; new callers should import from experimentation."""
+    # Import only when called so pipeline/model loading does not pull in the
+    # experimentation module or create an import cycle through its pipeline builder.
+    from parkinsons_ml.experimentation import training_config as configure
+
+    return configure(value)
+
+
+def run_experiment(config: "TrainConfig", directory: Path, tracking_uri: str) -> "ComparisonResult":
+    """Compatibility entry point; MLflow orchestration now belongs to tracking."""
+    # Keep tracking dependencies out of inference-only imports of this module.
+    from parkinsons_ml.tracking import run_experiment as run
+
+    return run(config, directory, tracking_uri)
+
+
+def main() -> None:
+    """Preserve python -m parkinsons_ml.training as a thin CLI delegate."""
+    from parkinsons_ml.tracking import main as tracking_main
+
+    tracking_main()
+
+
+if __name__ == "__main__":
+    main()
