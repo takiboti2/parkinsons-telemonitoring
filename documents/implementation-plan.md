@@ -46,20 +46,18 @@ pipeline construction. See README for the module boundaries, CLI, and policy.
 - Capture genuine development-system run evidence when running real-data experiments;
   integration tests use generated datasets and temporary tracking servers.
 
-## 5. Use one champion alias for guarded deployment
+## 5. Integrate champion selection with serving
 
-- Register a candidate, load its immutable registry version, and check schema and
-  finite predictions before promotion. Confirm required artifacts are saved.
-- Define a versioned acceptance policy: no validation-MAE degradation against the
-  champion under comparable dataset/split/evaluation identities. Reject automatic
-  promotion when scores are not comparable; log the decision and reason.
-- Serialize training/promotion with one guard. Update `champion` only after checks
-  pass; rejected or unloadable candidates leave the alias unchanged.
-- Keep `champion` as the sole deployment pointer, not a second active-model state.
-  Each prediction resolves the alias once and loads that exact version. Add an
-  immutable-version cache only if measured latency requires it.
-- Retain older versions for manual rollback by alias reassignment. Verify alias
-  state after an ambiguous update failure; do not report unconfirmed promotion.
+Automatic strict-MAE promotion, immutable registry validation, a promotion-only
+single-host guard, alias rollback, and limited interrupted-update reconciliation
+are implemented. See README for configuration, audit records, and limitations.
+
+- Each future prediction must resolve `champion` once and load that exact version;
+  do not introduce a second active-model pointer. Add an immutable-version cache
+  only if measured latency requires it.
+- Expose promotion decisions separately from completed training in the API/UI.
+- Capture genuine operational evidence and document reviewed manual alias changes
+  without bypassing unresolved promotion intents or comparability checks.
 
 ## 6. Expose training and logged prediction through FastAPI
 

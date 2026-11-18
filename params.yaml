@@ -5,4 +5,43 @@ prepare:
   extreme_iqr_multiplier: 1.5
 train:
   experiment_name: motor-updrs-training
-  extra_feature_sets: {}
+  promotion:
+    enabled: true
+    registered_model_name: motor-updrs
+  extra_feature_sets:
+    # All selections retain test_time; age and sex are varied independently.
+    # Jitter family: relative/absolute jitter and RAP, PPQ5, DDP derivatives.
+    jitter_age_sex:
+      [age, sex, test_time, jitter, jitter_abs, jitter_rap, jitter_ppq5, jitter_ddp]
+    jitter_age:
+      [age, test_time, jitter, jitter_abs, jitter_rap, jitter_ppq5, jitter_ddp]
+    jitter_sex:
+      [sex, test_time, jitter, jitter_abs, jitter_rap, jitter_ppq5, jitter_ddp]
+    jitter_only:
+      [test_time, jitter, jitter_abs, jitter_rap, jitter_ppq5, jitter_ddp]
+
+    # Shimmer family: amplitude perturbation and APQ/DDA derivatives.
+    shimmer_age_sex:
+      [age, sex, test_time, shimmer, shimmer_db, shimmer_apq3, shimmer_apq5, shimmer_apq11, shimmer_dda]
+    shimmer_age:
+      [age, test_time, shimmer, shimmer_db, shimmer_apq3, shimmer_apq5, shimmer_apq11, shimmer_dda]
+    shimmer_sex:
+      [sex, test_time, shimmer, shimmer_db, shimmer_apq3, shimmer_apq5, shimmer_apq11, shimmer_dda]
+    shimmer_only:
+      [test_time, shimmer, shimmer_db, shimmer_apq3, shimmer_apq5, shimmer_apq11, shimmer_dda]
+
+    # Noise ratios, complexity/nonlinear measures, and pitch-period entropy.
+    noise_complexity_age_sex: [age, sex, test_time, nhr, hnr, rpde, dfa, ppe]
+    noise_complexity_age: [age, test_time, nhr, hnr, rpde, dfa, ppe]
+    noise_complexity_sex: [sex, test_time, nhr, hnr, rpde, dfa, ppe]
+    noise_complexity_only: [test_time, nhr, hnr, rpde, dfa, ppe]
+
+    # Paired voice families, retaining age and test_time but excluding sex.
+    jitter_shimmer_age:
+      [age, test_time, jitter, jitter_abs, jitter_rap, jitter_ppq5, jitter_ddp,
+       shimmer, shimmer_db, shimmer_apq3, shimmer_apq5, shimmer_apq11, shimmer_dda]
+    jitter_noise_complexity_age:
+      [age, test_time, jitter, jitter_abs, jitter_rap, jitter_ppq5, jitter_ddp, nhr, hnr, rpde, dfa, ppe]
+    shimmer_noise_complexity_age:
+      [age, test_time, shimmer, shimmer_db, shimmer_apq3, shimmer_apq5, shimmer_apq11, shimmer_dda,
+       nhr, hnr, rpde, dfa, ppe]

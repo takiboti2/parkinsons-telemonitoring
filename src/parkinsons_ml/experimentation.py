@@ -7,7 +7,7 @@ import re
 from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import numpy as np
 import pandas as pd
@@ -40,14 +40,48 @@ class FeatureSet:
 
 
 @dataclass(frozen=True)
+class PromotionConfig:
+    """Registry naming only; score comparison and alias policy are fixed in code."""
+
+    enabled: bool = False
+    registered_model_name: str = "motor-updrs"
+
+    def __post_init__(self) -> None:
+        if type(self.enabled) is not bool:
+            raise ValueError("promotion.enabled must be a boolean")
+        if type(self.registered_model_name) is not str or not re.fullmatch(
+            r"[a-zA-Z][a-zA-Z0-9_.-]{0,127}", self.registered_model_name
+        ):
+            raise ValueError("registered_model_name must be a simple identifier of at most 128 characters")
+
+
+@dataclass(frozen=True)
+class PromotionResult:
+    """Keep successful training distinct from registry decisions and failures."""
+
+    decision: Literal["promoted", "retained", "rejected", "disabled", "failed"]
+    reason: str
+    registered_model_name: str
+    run_id: str | None = None
+    previous_version: str | None = None
+    candidate_version: str | None = None
+    previous_mae: float | None = None
+    candidate_mae: float | None = None
+    confirmed: bool = True
+
+
+@dataclass(frozen=True)
 class TrainConfig:
     # This is the expanded comparison, including the two mandatory configurations.
     experiment_name: str
     feature_sets: tuple[FeatureSet, ...]
+    promotion: PromotionConfig = PromotionConfig()
 
     def __post_init__(self) -> None:
         # Validate the expanded configuration once, whether it comes from YAML or
         # a Python caller. Do not reconstruct a YAML-shaped mapping in orchestration.
+        if type(self.promotion) is not PromotionConfig:
+            raise ValueError("promotion must be a validated PromotionConfig")
         if type(self.experiment_name) is not str or not self.experiment_name.strip():
             raise ValueError("experiment_name must be a nonempty string")
         names: set[str] = set()
@@ -99,14 +133,21 @@ UniqueKeyLoader.add_constructor("tag:yaml.org,2002:map", unique_mapping)
 def training_config(value: object) -> TrainConfig:
     """Validate YAML settings, including mandatory and redundant selections."""
     # Treat misspelled options as errors rather than silently using defaults.
-    if not isinstance(value, dict) or set(value) - {"experiment_name", "extra_feature_sets"}:
-        raise ValueError("train must contain only experiment_name and extra_feature_sets")
+    if not isinstance(value, dict) or set(value) - {"experiment_name", "extra_feature_sets", "promotion"}:
+        raise ValueError("train must contain only experiment_name, extra_feature_sets, and promotion")
     name = value.get("experiment_name")
     extras = value.get("extra_feature_sets", {})
     if not isinstance(name, str):
         raise ValueError("experiment_name must be a nonempty string")
     if not isinstance(extras, dict):
         raise ValueError("extra_feature_sets must be a mapping")
+    promotion = value.get("promotion", {})
+    if not isinstance(promotion, dict):
+        raise ValueError("promotion must be a mapping")
+    try:
+        promotion_config = PromotionConfig(**promotion)
+    except TypeError as error:
+        raise ValueError("Unknown promotion configuration keys") from error
     # Extras extend this fixed comparison; they cannot replace its reference models.
     selections = [
         FeatureSet("baseline", validate_features(BASELINE_FEATURES)),
@@ -118,7 +159,7 @@ def training_config(value: object) -> TrainConfig:
         selected = validate_features(features)
         selections.append(FeatureSet(key, selected))
     # TrainConfig enforces names, required selections, and canonical uniqueness.
-    return TrainConfig(name, tuple(selections))
+    return TrainConfig(name, tuple(selections), promotion_config)
 
 
 def json_mapping(payload: bytes) -> dict[str, object]:
@@ -361,6 +402,7 @@ class ComparisonResult:
     dataset_id: str
     split_id: str
     evaluation_id: str = EVALUATION_VERSION
+    promotion: PromotionResult | None = None
 
 
 def select_winner(results: Sequence[ConfigurationResult]) -> ConfigurationResult:

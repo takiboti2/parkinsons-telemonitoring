@@ -143,10 +143,12 @@ An explicit HTTP/HTTPS URI is required; no filesystem fallback is used. Plain HT
 is accepted only for `localhost` or loopback IP addresses (including IPv6 `::1`);
 remote hosts require HTTPS and appropriately configured server access control.
 Tracking and model loading use that same server. The CLI prints a JSON result with
-parent and child run IDs, model URIs, validation metrics, identities, and the winner.
+parent and child run IDs, model URIs, validation metrics, identities, the winner,
+and a separate promotion decision.
 `--params` and `--data` override the parameter file and prepared directory.
-Run one comparison at a time, never concurrently with preparation or inside an
-existing MLflow run.
+Do not run comparisons concurrently within one process, with preparation, or
+inside an existing MLflow run. Separate single-host processes can train independently;
+only their registry promotion operations share a nonblocking local lock.
 
 The implementation is split by responsibility:
 
@@ -155,6 +157,7 @@ The implementation is split by responsibility:
 | `src/parkinsons_ml/training.py` | Feature validation, serialized `FeaturePreparation`, pipeline construction |
 | `src/parkinsons_ml/experimentation.py` | Configuration, prepared snapshot validation, grouped evaluation, metrics, result types |
 | `src/parkinsons_ml/tracking.py` | MLflow orchestration, artifacts, lineage, repository checks, CLI |
+| `src/parkinsons_ml/promotion.py` | Registry eligibility, immutable-version validation, guarded alias updates and rollback |
 
 For Python callers, use the owning modules directly:
 
@@ -187,6 +190,9 @@ extend them, for example:
 ```yaml
 train:
   experiment_name: motor-updrs-training
+  promotion:
+    enabled: true
+    registered_model_name: motor-updrs
   extra_feature_sets:
     voice_subset: [jitter, ppe]
 ```
@@ -219,8 +225,54 @@ table or arbitrary working-tree files.
 Required fit, prediction, logging, artifact upload, or reload errors fail the
 comparison; completed children can remain for diagnosis but cannot yield a partial
 winner. MLflow context managers mark failed runs when the server is reachable;
-an outage can leave remote status uncertain. There is no retry/resume or automatic
-promotion. Final-test assessment and registry/`champion` changes are separate work.
+an outage can leave remote status uncertain. There is no training retry/resume.
+Final-test assessment remains a separate operation and never drives promotion.
+
+### Automatic champion promotion
+
+The repository's `params.yaml` enables promotion to the registered model
+`motor-updrs`, using the fixed **`champion`** alias. If the `promotion` block is
+omitted, promotion defaults to disabled for compatibility with programmatic callers
+and older parameter files. Set `enabled: false` for experimentation without registry changes.
+The current file compares 17 configurations, including the baseline/full candidate,
+individual voice families, and age-plus-time combinations of two voice families.
+
+After the entire comparison has finished successfully:
+
+1. Resolve the incumbent champion and read authoritative completed-run metadata.
+2. Promote the first valid winner when no champion exists. Otherwise require
+   **strictly lower pooled `oof_mae`** with matching dataset, split, schema,
+   preparation-policy, and evaluation-policy identities. Exact ties retain the
+   incumbent. Missing or incompatible provenance rejects automatic promotion.
+3. Register only an eligible winner. Load its exact registry version, verify the
+   pipeline/signature/features, and compare predictions with its saved refit artifact.
+4. Record the intended previous/new versions, update `champion`, and read back
+   the alias. A failed update automatically restores the previous alias; failed
+   bootstrap removes the new alias instead. Older versions remain available.
+
+Each completed registry assessment has a separate MLflow run tagged `purpose=champion-promotion`, with
+the comparison run ID, registered model name, policy version, and `decision.json`.
+The returned `promotion` object reports `promoted`, `retained`, `rejected`,
+`disabled`, or `failed`, along with available version IDs, scores, and confirmation status.
+Disabled promotion and failure to acquire the guard do not create an audit run.
+A promotion failure does not mark the completed training comparison failed; inspect
+the separate promotion result rather than assuming training success means deployment.
+
+The guard is `storage/mlflow/promotion.lock`; it covers registry work, not model
+fitting. All automatic writers must run on this one host using the same guard.
+External/manual registry writers do not honor this lock; unexpected alias changes
+are not overwritten and require operator review.
+
+If rollback cannot be confirmed, the registry retains a `pending_promotion_run_id`
+tag referencing the audit intent. Before the next automatic promotion, the code
+reconciles that one operation: preserve a fully audited success, or roll back an
+interrupted update. An unresolved or inconsistent intent blocks another automatic
+update. Do not clear the marker merely to bypass a failure; first verify the alias
+and recorded old/new versions. There is no queue, scheduler, second deployment
+pointer, additional database, or general workflow-recovery framework.
+
+The alias is the deployment selection only; API/model-serving activation is not
+implemented yet. Registered artifacts and writers must be trusted.
 
 ## MLflow tracking server
 

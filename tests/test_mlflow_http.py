@@ -9,6 +9,7 @@ import sys
 import time
 from collections.abc import Generator, Iterator
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 
 import httpx
@@ -23,7 +24,7 @@ from mlflow.tracking.fluent import ActiveModelContext
 from mlflow.utils.thread_utils import ThreadLocalVariable
 from sklearn.linear_model import LinearRegression
 
-from parkinsons_ml import experimentation, tracking, training
+from parkinsons_ml import experimentation, promotion, tracking, training
 from parkinsons_ml.schema import BASELINE_FEATURES, CANDIDATE_FEATURES
 from parkinsons_ml.training import FeaturePreparation, build_pipeline
 
@@ -279,6 +280,195 @@ def test_training_failures_do_not_select_partial_winner(
             with pytest.raises(ValueError, match="unrelated"):
                 tracking.run_experiment(config, prepared_directory, uri)
             assert mlflow.active_run() is caller
+
+
+def test_champion_policy_rollback_and_recovery_http(
+    tmp_path: Path,
+    prepared_directory: Path,
+    http_tracking_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store, port = tmp_path / "server", free_port()
+    name = "promotion-test"
+    lock = tmp_path / "promotion.lock"
+    with running_server(store, port) as uri:
+        mlflow.set_tracking_uri(uri)
+        mlflow.set_registry_uri(uri)
+        client = mlflow.MlflowClient(tracking_uri=uri, registry_uri=uri)
+        config = experimentation.training_config({"experiment_name": "promotion-comparisons"})
+        first = tracking.run_experiment(config, prepared_directory, uri)
+        second = tracking.run_experiment(config, prepared_directory, uri)
+        assert first.promotion is not None and first.promotion.decision == "disabled"
+        # Set controlled authoritative validation outcomes on real completed runs;
+        # the returned ComparisonResult still holds its original scores. Promotion
+        # must read MLflow rather than trusting those stale caller values.
+        client.log_metric(first.winner.run_id, "oof_mae", 2.0)
+        client.log_metric(second.winner.run_id, "oof_mae", 1.0)
+
+        def promote(result: experimentation.ComparisonResult, model: str = name) -> experimentation.PromotionResult:
+            return promotion.promote_winner(client, result, experimentation.PromotionConfig(True, model), lock)
+
+        bootstrap = promote(first)
+        assert bootstrap.decision == "promoted" and bootstrap.reason == "bootstrap"
+        old = bootstrap.candidate_version
+        assert old is not None and bootstrap.candidate_mae == 2.0
+        assert promotion.champion_version(client, name) == old
+        assert promote(first).decision == "retained"  # exact tie
+        assert len(client.search_model_versions(f"name = '{name}'")) == 1
+        client.log_metric(second.winner.run_id, "oof_mae", 3.0)
+        assert promote(second).decision == "retained"
+        assert len(client.search_model_versions(f"name = '{name}'")) == 1
+        client.log_metric(second.winner.run_id, "oof_mae", 1.0)
+        better = promote(second)
+        assert better.decision == "promoted" and better.previous_mae == 2.0 and better.candidate_mae == 1.0
+        assert promotion.champion_version(client, name) == better.candidate_version
+        # Return to the first immutable version to exercise failure paths against
+        # an independently completed, eligible candidate without retraining it.
+        client.set_registered_model_alias(name, "champion", old)
+
+        previous_identity = client.get_run(second.winner.run_id).data.tags["dataset_id"]
+        client.set_tag(second.winner.run_id, "dataset_id", "different")
+        client.set_tag(second.run_id, "dataset_id", "different")
+        incomparable = promote(second)
+        assert incomparable.decision == "rejected" and "incomparable" in incomparable.reason
+        client.set_tag(second.winner.run_id, "dataset_id", previous_identity)
+        client.set_tag(second.run_id, "dataset_id", previous_identity)
+        assert promotion.champion_version(client, name) == old
+
+        client.delete_model_version_tag(name, old, "promotion_policy")
+        assert promote(second).decision == "rejected"
+        client.set_model_version_tag(name, old, "promotion_policy", promotion.POLICY)
+        client.set_model_version_tag(name, old, "oof_mae", "999.0")
+        assert promote(second).decision == "rejected"
+        client.set_model_version_tag(name, old, "oof_mae", "2.0")
+        assert promote(replace(second, run_id=first.run_id)).decision == "rejected"
+        assert promote(replace(second, configurations=(*second.configurations, first.winner))).decision == "rejected"
+        for model_uri in ("runs:/unapproved", first.winner.model_uri):
+            wrong = replace(second, winner=replace(second.winner, model_uri=model_uri))
+            assert promote(wrong).decision == "rejected"
+
+        # A finished child cannot deploy from an unfinished/failed comparison.
+        client.set_terminated(second.run_id, "FAILED")
+        assert promote(second).decision == "rejected"
+        client.set_terminated(second.run_id, "FINISHED")
+        with monkeypatch.context() as patch:
+
+            def invalid_model(uri: str) -> None:
+                return None
+
+            patch.setattr(promotion, "load_model", invalid_model)
+            assert promote(second).decision == "rejected"
+        assert promotion.champion_version(client, name) == old
+
+        original_set = client.set_registered_model_alias
+
+        def applied_then_timed_out() -> object:
+            # Return a callable with per-operation state: fail only the update,
+            # allowing the subsequent automatic rollback request to succeed.
+            applied = False
+
+            def update(model: str, alias: str, version: str) -> None:
+                nonlocal applied
+                original_set(model, alias, version)
+                if not applied:
+                    applied = True
+                    raise TimeoutError("response lost after applying alias")
+
+            return update
+
+        with monkeypatch.context() as patch:
+            patch.setattr(client, "set_registered_model_alias", applied_then_timed_out())
+            failed = promote(second)
+        assert failed.decision == "failed" and failed.confirmed
+        assert promotion.champion_version(client, name) == old
+        assert promotion.PENDING not in client.get_registered_model(name).tags
+
+        with monkeypatch.context() as patch:
+            patch.setattr(client, "set_registered_model_alias", applied_then_timed_out())
+            failed_bootstrap = promote(second, "bootstrap-failure")
+        assert failed_bootstrap.decision == "failed" and failed_bootstrap.confirmed
+        assert promotion.champion_version(client, "bootstrap-failure") is None
+
+        # Required decision logging failures also roll back rather than reporting
+        # an unaudited promotion as successful.
+        original_log = client.log_dict
+        logged_failure = False
+
+        def fail_decision_once(run_id: str, dictionary: dict[str, object], artifact_file: str) -> None:
+            nonlocal logged_failure
+            if artifact_file == "decision.json" and not logged_failure:
+                logged_failure = True
+                raise ConnectionError("audit response lost")
+            original_log(run_id, dictionary, artifact_file)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(client, "log_dict", fail_decision_once)
+            assert promote(second).decision == "failed"
+        assert promotion.champion_version(client, name) == old
+
+        # Failed rollback leaves a durable marker. A later invocation first
+        # restores the old alias, then makes its own fresh eligibility decision.
+        def unreachable(*args: object, **kwargs: object) -> None:
+            raise ConnectionError("unreachable")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(client, "set_registered_model_alias", applied_then_timed_out())
+            patch.setattr(promotion, "restore_alias", unreachable)
+            uncertain = promote(second)
+        assert uncertain.decision == "failed" and not uncertain.confirmed
+        assert client.get_registered_model(name).tags[promotion.PENDING] == uncertain.run_id
+        assert promotion.champion_version(client, name) == uncertain.candidate_version
+        client.log_metric(second.winner.run_id, "oof_mae", 3.0)
+        assert promote(second).decision == "retained"
+        assert promotion.champion_version(client, name) == old
+        assert promotion.PENDING not in client.get_registered_model(name).tags
+        assert uncertain.run_id is not None
+        assert client.get_run(uncertain.run_id).data.tags["state"] == "complete"
+
+        # A committed success with failed marker cleanup is retained on recovery,
+        # not incorrectly rolled back as if the process had died before commit.
+        client.log_metric(second.winner.run_id, "oof_mae", 1.0)
+        with monkeypatch.context() as patch:
+            patch.setattr(client, "delete_registered_model_tag", unreachable)
+            committed = promote(second)
+        assert committed.decision == "promoted"
+        assert promotion.PENDING in client.get_registered_model(name).tags
+        assert promote(second).decision == "retained"
+        assert promotion.champion_version(client, name) == committed.candidate_version
+        assert promotion.PENDING not in client.get_registered_model(name).tags
+    with running_server(store, port) as uri:
+        client = mlflow.MlflowClient(tracking_uri=uri, registry_uri=uri)
+        assert promotion.champion_version(client, name) == committed.candidate_version
+        assert committed.run_id is not None
+        assert client.get_run(committed.run_id).info.status == "FINISHED"
+
+
+def test_automatic_promotion_only_after_finished_training_http(
+    tmp_path: Path,
+    prepared_directory: Path,
+    http_tracking_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tracking, "PROMOTION_LOCK", tmp_path / "promotion.lock")
+    config = experimentation.training_config(
+        {"experiment_name": "automatic", "promotion": {"enabled": True, "registered_model_name": "automatic-model"}}
+    )
+    with running_server(tmp_path / "server", free_port()) as uri:
+        result = tracking.run_experiment(config, prepared_directory, uri)
+        assert result.promotion is not None and result.promotion.decision == "promoted"
+        client = mlflow.MlflowClient(tracking_uri=uri, registry_uri=uri)
+        assert client.get_run(result.run_id).info.status == "FINISHED"
+        assert promotion.champion_version(client, "automatic-model") == result.promotion.candidate_version
+
+        # Promotion failure remains separate from successful training.
+        def busy(*args: object, **kwargs: object) -> experimentation.PromotionResult:
+            return experimentation.PromotionResult("failed", "promotion_busy", "automatic-model")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(tracking, "promote_winner", busy)
+            completed = tracking.run_experiment(config, prepared_directory, uri)
+        assert completed.promotion is not None and completed.promotion.decision == "failed"
+        assert client.get_run(completed.run_id).info.status == "FINISHED"
 
 
 @pytest.mark.parametrize(

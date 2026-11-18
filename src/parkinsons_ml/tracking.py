@@ -7,7 +7,7 @@ import os
 import subprocess
 import sys
 from contextlib import redirect_stdout
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -36,11 +36,13 @@ from parkinsons_ml.experimentation import (
     validate_predictions,
 )
 from parkinsons_ml.schema import POLICY_VERSION, SCHEMA_VERSION
+from parkinsons_ml.promotion import promote_winner
 from parkinsons_ml.training import build_pipeline
 
 # Training is deliberately repository-only. Validate this source-layout assumption
 # before contacting MLflow rather than misidentifying a wheel's site-packages root.
 ROOT = Path(__file__).resolve().parents[2]
+PROMOTION_LOCK = ROOT / "storage/mlflow/promotion.lock"
 
 
 def validate_repository() -> None:
@@ -203,7 +205,7 @@ def log_configuration(snapshot: TrainingSnapshot, selection: FeatureSet) -> Conf
 
 
 def run_experiment(config: TrainConfig, directory: Path, tracking_uri: str) -> ComparisonResult:
-    """Synchronous comparison; no final-test access, registry writes, or partial winner."""
+    """Complete a comparison, then optionally promote its winner without final-test access."""
     # TrainConfig validates itself at construction, including direct Python use.
     # Require an explicit server and keep embedded credentials/query values out of
     # URIs that MLflow may persist or display. No local tracking fallback is allowed.
@@ -288,7 +290,10 @@ def run_experiment(config: TrainConfig, directory: Path, tracking_uri: str) -> C
             mlflow.set_tags(
                 {"winner": winner.name, "winner_run_id": winner.run_id, "winner_model_uri": winner.model_uri}
             )
-            return result
+        # Promotion sees only FINISHED comparisons. Its outcome is separate from
+        # training success and has its own audit run; failures preserve training records.
+        promotion = promote_winner(client, result, config.promotion, PROMOTION_LOCK)
+        return replace(result, promotion=promotion)
     finally:
         # Restore routing even if server access, fitting, or artifact operations fail.
         # Preserve unset environment variables as unset, not as getter defaults.
