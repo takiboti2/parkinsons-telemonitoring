@@ -1,24 +1,30 @@
 """Predict with one immutable champion version and require complete MLflow logging."""
 
 import math
+import sys
 import time
-from contextlib import suppress
+from collections.abc import Generator
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from uuid import uuid4
 
 import mlflow
 import numpy as np
 import pandas as pd
 from mlflow.entities.model_registry import ModelVersion
+from mlflow.artifacts import download_artifacts
 from mlflow.exceptions import MlflowException
-from mlflow.models import get_model_info
+from mlflow.models import Model
 from mlflow.sklearn import load_model
 from mlflow.tracking import MlflowClient
 from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline
 
 from parkinsons_ml.experimentation import validate_predictions
-from parkinsons_ml.promotion import IDENTITIES, champion_version
+from parkinsons_ml import tracking
+from parkinsons_ml.promotion import IDENTITIES, PENDING, promotion_lock
 from parkinsons_ml.schema import CANDIDATE_FEATURES, POLICY_VERSION, SCHEMA_VERSION
 from parkinsons_ml.tracking import tracking_context
 from parkinsons_ml.training import FeaturePreparation, validate_features
@@ -46,61 +52,89 @@ class PredictionResult:
 
 
 def resolve_champion(client: MlflowClient, name: str) -> ModelVersion:
-    """Resolve the alias once; all later work uses this exact version number."""
+    """Capture a committed version under the same brief guard as alias writers."""
     try:
-        version = champion_version(client, name)
-        if version is None:
-            raise UnavailableError("No champion is available")
-        resolved = client.get_model_version(name, version)
-        if resolved.status != "READY":
-            raise UnavailableError("Champion version is not ready")
-        return resolved
-    except UnavailableError:
-        raise
-    except Exception as error:
+        with promotion_lock(tracking.PROMOTION_LOCK, shared=True):
+            try:
+                model = client.get_registered_model(name)
+            except MlflowException as error:
+                # An unregistered model is a bootstrap state, not an outage.
+                if error.error_code == "RESOURCE_DOES_NOT_EXIST":
+                    raise UnavailableError("No champion is available") from error
+                raise
+            # A crashed promoter releases its file lock but leaves this marker.
+            # Serving must fail closed until promotion reconciles the intent.
+            if model.tags.get(PENDING):
+                raise UnavailableError("Champion promotion is not yet confirmed")
+            version = model.aliases.get("champion")
+            if version is None:
+                raise UnavailableError("No champion is available")
+            resolved = client.get_model_version(name, version)
+            if resolved.status != "READY":
+                raise UnavailableError("Champion version is not ready")
+            return resolved
+    except BlockingIOError as error:
+        raise UnavailableError("Champion promotion is in progress") from error
+    except (MlflowException, OSError) as error:
         raise UnavailableError("Champion registry is unavailable") from error
 
 
-def load_pipeline(version: ModelVersion) -> tuple[Pipeline, tuple[str, ...]]:
-    """Load fresh artifacts without caching or consulting the alias again."""
+@contextmanager
+def load_pipeline(version: ModelVersion) -> Generator[tuple[Pipeline, tuple[str, ...]]]:
+    """Own model downloads/import-path changes for the entire prediction operation."""
     if not version.run_id or any(not version.tags.get(key) for key in IDENTITIES):
         raise ModelError("Champion provenance is incomplete")
     if (version.tags["schema_version"], version.tags["policy_version"]) != (SCHEMA_VERSION, POLICY_VERSION):
         raise ModelError("Champion schema/policy is unsupported")
     uri = f"models:/{version.name}/{version.version}"
-    try:
-        pipeline = load_model(uri)
-        signature = get_model_info(uri).signature
-    except MlflowException as error:
-        if error.error_code in {"RESOURCE_DOES_NOT_EXIST", "INVALID_PARAMETER_VALUE"}:
-            raise ModelError("Champion artifact is unavailable or invalid") from error
-        raise UnavailableError("Model artifact service is unavailable") from error
-    except Exception as error:
-        raise ModelError("Champion artifact could not be loaded") from error
-    if not isinstance(pipeline, Pipeline) or tuple(pipeline.named_steps) != (
-        "features",
-        "imputation",
-        "linearregression",
-    ):
-        raise ModelError("Champion is not a complete approved pipeline")
-    selector = pipeline.named_steps["features"]
-    if (
-        not isinstance(selector, FeaturePreparation)
-        or type(pipeline.named_steps["linearregression"]) is not LinearRegression
-    ):
-        raise ModelError("Champion contains an unsupported estimator or selector")
-    try:
-        features = validate_features(selector.features)
-    except ValueError as error:
-        raise ModelError("Champion selection is invalid") from error
-    if (
-        selector.features != features
-        or signature is None
-        or signature.inputs is None
-        or (signature.inputs.input_names() != list(features))
-    ):
-        raise ModelError("Champion signature/selection is inconsistent")
-    return pipeline, features
+    previous_path = list(sys.path)
+    with TemporaryDirectory(prefix="parkinsons-inference-") as temporary:
+        try:
+            try:
+                local_path = download_artifacts(artifact_uri=uri, dst_path=temporary)
+            except MlflowException as error:
+                if error.error_code in {"RESOURCE_DOES_NOT_EXIST", "INVALID_PARAMETER_VALUE"}:
+                    raise ModelError("Champion artifact is unavailable or invalid") from error
+                raise UnavailableError("Model artifact service is unavailable") from error
+            except OSError as error:
+                raise UnavailableError("Model artifact download is unavailable") from error
+            try:
+                # Read the signature from the same download, not a second remote
+                # lookup. Post-load checks are compatibility checks, not a sandbox:
+                # model artifacts and their writers must still be trusted.
+                pipeline = load_model(local_path)
+                signature = Model.load(str(Path(local_path) / "MLmodel")).signature
+            except (MlflowException, OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+                raise ModelError("Champion artifact could not be loaded") from error
+            if not isinstance(pipeline, Pipeline) or tuple(pipeline.named_steps) != (
+                "features",
+                "imputation",
+                "linearregression",
+            ):
+                raise ModelError("Champion is not a complete approved pipeline")
+            selector = pipeline.named_steps["features"]
+            if (
+                not isinstance(selector, FeaturePreparation)
+                or type(pipeline.named_steps["linearregression"]) is not LinearRegression
+            ):
+                raise ModelError("Champion contains an unsupported estimator or selector")
+            try:
+                features = validate_features(selector.features)
+            except ValueError as error:
+                raise ModelError("Champion selection is invalid") from error
+            if (
+                selector.features != features
+                or signature is None
+                or signature.inputs is None
+                or signature.inputs.input_names() != list(features)
+            ):
+                raise ModelError("Champion signature/selection is inconsistent")
+            yield pipeline, features
+        finally:
+            # The API serializes model operations. Remove SDK-added import paths
+            # before deleting their directories, on failures as well as success.
+            # Keep the files alive until prediction/logging finishes for lazy imports.
+            sys.path[:] = previous_path
 
 
 def prepare_inputs(records: list[dict[str, float | int | None]], features: tuple[str, ...]) -> pd.DataFrame:
@@ -144,54 +178,51 @@ def predict_batch(
     started = time.perf_counter()
     with tracking_context(tracking_uri) as client:
         version = resolve_champion(client, model_name)
-        pipeline, features = load_pipeline(version)
-        inputs = prepare_inputs(records, features)
-        assert version.run_id is not None  # checked by load_pipeline before any logging
-        # Use client APIs rather than fluent active runs. API operation serialization
-        # still protects the process-wide routing needed by model artifact loaders.
-        try:
-            source = client.get_run(version.run_id)
-            experiment = client.get_experiment(source.info.experiment_id)
-            if not experiment.artifact_location.startswith("mlflow-artifacts:/"):
-                raise ModelError("Inference requires HTTP-served artifact storage")
-            run = client.create_run(
-                source.info.experiment_id,
-                tags={
-                    "purpose": "inference",
-                    "mlflow.runName": "prediction-batch",
-                    "request_id": request_id,
-                    "registered_model_name": model_name,
-                    "model_version": version.version,
-                    "training_run_id": version.run_id,
-                    "reference_run_id": version.run_id,
-                    "reference_artifact": "monitoring/reference.csv",
-                    "representation": "selected-pre-imputation-v1",
-                    **{key: version.tags[key] for key in IDENTITIES},
-                },
-            )
-        except ModelError:
-            raise
-        except Exception as error:
-            raise UnavailableError("Inference logging could not be started") from error
-        try:
-            client.log_text(run.info.run_id, inputs.to_csv(index=False), "inputs.csv")
+        with load_pipeline(version) as (pipeline, features):
+            inputs = prepare_inputs(records, features)
+            assert version.run_id is not None  # checked by load_pipeline before any logging
+            # Direct client APIs avoid fluent active runs and never re-resolve champion.
             try:
-                predicted = np.asarray(pipeline.predict(inputs), dtype=np.float64)
-                validate_predictions(predicted, (len(inputs),))
+                source = client.get_run(version.run_id)
+                experiment = client.get_experiment(source.info.experiment_id)
+                if not experiment.artifact_location.startswith("mlflow-artifacts:/"):
+                    raise ModelError("Inference requires HTTP-served artifact storage")
+                run = client.create_run(
+                    source.info.experiment_id,
+                    tags={
+                        "purpose": "inference",
+                        "mlflow.runName": "prediction-batch",
+                        "request_id": request_id,
+                        "registered_model_name": model_name,
+                        "model_version": version.version,
+                        "training_run_id": version.run_id,
+                        "reference_run_id": version.run_id,
+                        "reference_artifact": "monitoring/reference.csv",
+                        "representation": "selected-pre-imputation-v1",
+                        **{key: version.tags[key] for key in IDENTITIES},
+                    },
+                )
+            except (MlflowException, OSError) as error:
+                raise UnavailableError("Inference logging could not be started") from error
+            try:
+                client.log_text(run.info.run_id, inputs.to_csv(index=False), "inputs.csv")
+                try:
+                    predicted = np.asarray(pipeline.predict(inputs), dtype=np.float64)
+                    validate_predictions(predicted, (len(inputs),))
+                except (ValueError, TypeError, RuntimeError, ArithmeticError) as error:
+                    raise ModelError("Champion prediction failed or returned invalid values") from error
+                output = pd.DataFrame({"row": np.arange(len(inputs)), "prediction": predicted})
+                client.log_text(run.info.run_id, output.to_csv(index=False), "predictions.csv")
+                client.log_param(run.info.run_id, "features", ",".join(features))
+                client.log_metric(run.info.run_id, "batch_size", len(inputs))
+                client.log_metric(run.info.run_id, "processing_seconds", time.perf_counter() - started)
+                client.set_terminated(run.info.run_id, "FINISHED")
             except Exception as error:
-                raise ModelError("Champion prediction failed or returned invalid values") from error
-            output = pd.DataFrame({"row": np.arange(len(inputs)), "prediction": predicted})
-            client.log_text(run.info.run_id, output.to_csv(index=False), "predictions.csv")
-            client.log_param(run.info.run_id, "features", ",".join(features))
-            client.log_metric(run.info.run_id, "batch_size", len(inputs))
-            client.log_metric(run.info.run_id, "processing_seconds", time.perf_counter() - started)
-            client.set_terminated(run.info.run_id, "FINISHED")
-        except Exception as error:
-            # A server outage can prevent the remote failure update too. Never
-            # convert that uncertainty into successful, unlogged predictions.
-            with suppress(Exception):
-                client.set_terminated(run.info.run_id, "FAILED")
-            if isinstance(error, ModelError):
+                # Always attempt to close an opened run, including unexpected bugs,
+                # but only classify actual dependency failures as unavailability.
+                with suppress(Exception):
+                    client.set_terminated(run.info.run_id, "FAILED")
+                if isinstance(error, (MlflowException, OSError)):
+                    raise UnavailableError("Required inference logging failed") from error
                 raise
-            raise UnavailableError("Required inference logging failed") from error
-        return PredictionResult(request_id, run.info.run_id, model_name, version.version, tuple(predicted.tolist()))
+            return PredictionResult(request_id, run.info.run_id, model_name, version.version, tuple(predicted.tolist()))

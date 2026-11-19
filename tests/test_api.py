@@ -123,12 +123,55 @@ def test_body_limit_accumulates_stream_messages(application: FastAPI, disconnect
     async def send(message: Message) -> None:
         sent.append(message)
 
-    scope: Scope = {"type": "http", "method": "POST"}
-    asyncio.run(api.BodyLimit(application, max_bytes=8)(scope, receive, send))
+    scope: Scope = {"type": "http", "method": "POST", "headers": [(b"x-api-key", KEY.encode())]}
+    asyncio.run(api.RequestGuard(application, SecretStr(KEY), max_bytes=8)(scope, receive, send))
     if disconnect:
         assert not sent
     else:
         assert sent[0]["status"] == 413
+
+
+@pytest.mark.parametrize(
+    "headers", [[], [(b"x-api-key", b"wrong")], [(b"x-api-key", KEY.encode()), (b"x-api-key", KEY.encode())]]
+)
+def test_authentication_precedes_any_body_read(application: FastAPI, headers: list[tuple[bytes, bytes]]) -> None:
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        pytest.fail("Unauthenticated requests must not be read or JSON-parsed")
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    scope: Scope = {"type": "http", "method": "POST", "headers": headers}
+    asyncio.run(api.RequestGuard(application, SecretStr(KEY))(scope, receive, send))
+    assert sent[0]["status"] == 401
+
+
+def test_malformed_unauthenticated_json_is_rejected_before_parsing(application: FastAPI) -> None:
+    with TestClient(application) as client:
+        for path in ("/train", "/predict"):
+            response = client.post(path, content=b'{"private": malformed')
+            assert response.status_code == 401 and "private" not in response.text
+
+
+def test_body_read_has_an_overall_deadline(application: FastAPI) -> None:
+    sent: list[Message] = []
+
+    async def receive() -> Message:
+        await asyncio.Event().wait()
+        raise AssertionError("A stalled upload must be cancelled")
+
+    async def send(message: Message) -> None:
+        sent.append(message)
+
+    async def exercise() -> None:
+        scope: Scope = {"type": "http", "method": "POST", "headers": [(b"x-api-key", KEY.encode())]}
+        guard = api.RequestGuard(application, SecretStr(KEY), read_timeout=0.01)
+        await asyncio.wait_for(guard(scope, receive, send), timeout=1)
+
+    asyncio.run(exercise())
+    assert sent[0]["status"] == 408
 
 
 def test_nonfinite_json_and_configured_batch_limit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -261,3 +304,48 @@ def test_readiness_does_not_load_models_and_swagger_has_auth(
         monkeypatch.setattr(api, "resolve_champion", fail)
         response = client.get("/health/ready")
         assert response.status_code == 503 and "private" not in response.text
+
+
+def test_stalled_readiness_does_not_fill_the_shared_thread_pool(
+    application: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entered, release = Event(), Event()
+    calls = 0
+
+    def stalled(client: object, name: str) -> None:
+        nonlocal calls
+        calls += 1
+        entered.set()
+        assert release.wait(10)
+
+    def predict(*args: object) -> PredictionResult:
+        return PredictionResult("request", "run", "motor-updrs", "1", (12.0,))
+
+    monkeypatch.setattr(api, "resolve_champion", stalled)
+    monkeypatch.setattr(api, "predict_batch", predict)
+    monkeypatch.setattr(api, "READINESS_TIMEOUT", 0.05)
+    with TestClient(application) as client, ThreadPoolExecutor(max_workers=1) as requests:
+        first = requests.submit(client.get, "/health/ready")
+        try:
+            assert entered.wait(5)
+            for _ in range(45):
+                assert client.get("/health/ready").status_code == 503
+            assert first.result(timeout=2).status_code == 503
+            assert calls == 1  # no probe queue or per-request blocked worker
+            assert client.get("/health/live").json() == {"status": "alive"}
+            response = client.post("/predict", json={"records": [{"age": 60}]}, headers=AUTH)
+            assert response.status_code == 200
+        finally:
+            release.set()
+
+
+def test_readiness_programming_error_is_not_reported_as_an_outage(
+    application: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(*args: object) -> None:
+        raise RuntimeError("private programming detail")
+
+    monkeypatch.setattr(api, "resolve_champion", broken)
+    with TestClient(application) as client:
+        response = client.get("/health/ready")
+    assert response.status_code == 500 and "private" not in response.text

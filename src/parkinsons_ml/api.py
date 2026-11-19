@@ -1,12 +1,15 @@
 """Thin, authenticated single-worker FastAPI adapter for training and prediction."""
 
+import asyncio
 import hmac
 import logging
+from collections.abc import AsyncGenerator
+from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import asynccontextmanager
 from threading import Lock
-from typing import Annotated
 
 import yaml
-from fastapi import Depends, FastAPI, HTTPException, Security
+from fastapi import FastAPI, HTTPException, Security
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from fastapi.security import APIKeyHeader
@@ -31,6 +34,8 @@ LOGGER = logging.getLogger(__name__)
 PARAMS_PATH = ROOT / "params.yaml"
 DATA_DIRECTORY = ROOT / "data/processed"
 MAX_BODY_BYTES = 1024 * 1024
+BODY_READ_TIMEOUT = 10.0
+READINESS_TIMEOUT = 3.0
 
 
 class APISettings(BaseSettings):
@@ -96,41 +101,60 @@ class PredictRequest(BaseModel):
     )
 
 
-class BodyLimit:
-    """Bound actual received bytes before JSON parsing, including chunked bodies."""
+class RequestGuard:
+    """Authenticate POSTs before reading them, then bound upload bytes and time."""
 
-    def __init__(self, app: ASGIApp, max_bytes: int = MAX_BODY_BYTES) -> None:
+    def __init__(
+        self,
+        app: ASGIApp,
+        api_key: SecretStr,
+        max_bytes: int = MAX_BODY_BYTES,
+        read_timeout: float = BODY_READ_TIMEOUT,
+    ) -> None:
         self.app = app
+        self.api_key = api_key.get_secret_value().encode()
         self.max_bytes = max_bytes
+        self.read_timeout = read_timeout
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http" or scope["method"] != "POST":
             await self.app(scope, receive, send)
             return
-        chunks: list[bytes] = []
-        size = 0
-        while True:
-            message = await receive()
-            if message["type"] == "http.disconnect":
-                return
-            body = message.get("body", b"")
-            size += len(body)
-            if size > self.max_bytes:
-                await JSONResponse({"detail": "Request body is too large"}, status_code=413)(scope, receive, send)
-                return
-            chunks.append(body)
-            if not message.get("more_body", False):
-                break
-        # Buffer at most the configured cap. Replay once so FastAPI retains its
-        # normal JSON parsing, validation, and OpenAPI-generated request schemas.
-        payload = b"".join(chunks)
+        keys = [value for name, value in scope["headers"] if name.lower() == b"x-api-key"]
+        if len(keys) != 1 or not hmac.compare_digest(keys[0], self.api_key):
+            await JSONResponse({"detail": "Invalid API key"}, status_code=401, headers={"WWW-Authenticate": "ApiKey"})(
+                scope, receive, send
+            )
+            return
+        # A bytearray also bounds buffering overhead when a client sends many tiny
+        # chunks. The deadline covers the entire upload, not each individual chunk.
+        payload = bytearray()
+        try:
+            async with asyncio.timeout(self.read_timeout):
+                while True:
+                    message = await receive()
+                    if message["type"] == "http.disconnect":
+                        return
+                    body = message.get("body", b"")
+                    if len(payload) + len(body) > self.max_bytes:
+                        await JSONResponse({"detail": "Request body is too large"}, status_code=413)(
+                            scope, receive, send
+                        )
+                        return
+                    payload.extend(body)
+                    if not message.get("more_body", False):
+                        break
+        except TimeoutError:
+            await JSONResponse({"detail": "Request body upload timed out"}, status_code=408)(scope, receive, send)
+            return
+        # Replay once so FastAPI retains its normal JSON validation and schemas.
         sent = False
 
         async def replay() -> Message:
             nonlocal sent
             if not sent:
                 sent = True
-                return {"type": "http.request", "body": payload, "more_body": False}
+                return {"type": "http.request", "body": bytes(payload), "more_body": False}
             return await receive()
 
         await self.app(scope, replay, send)
@@ -147,17 +171,26 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
     config = training_config(parameters.get("train"))
     model_name = config.promotion.registered_model_name
     operation = Lock()
+    probe = Lock()
+    probe_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="champion-readiness")
+
+    @asynccontextmanager
+    async def lifespan(application: FastAPI) -> AsyncGenerator[None]:
+        try:
+            yield
+        finally:
+            # A timed-out SDK call cannot be killed safely. Never wait for it in
+            # the event loop or submit another probe while that call is running.
+            probe_worker.shutdown(wait=False, cancel_futures=True)
+
     app = FastAPI(
         title="Parkinson's Telemonitoring API",
         version="0.1.0",
         description="Research motor UPDRS prediction; not a clinical diagnostic service.",
+        lifespan=lifespan,
     )
-    app.add_middleware(BodyLimit)
+    app.add_middleware(RequestGuard, api_key=settings.api_key, read_timeout=BODY_READ_TIMEOUT)
     header = APIKeyHeader(name="X-API-Key", auto_error=False)
-
-    def authenticate(key: Annotated[str | None, Security(header)]) -> None:
-        if key is None or not hmac.compare_digest(key.encode(), settings.api_key.get_secret_value().encode()):
-            raise HTTPException(401, "Invalid API key", headers={"WWW-Authenticate": "ApiKey"})
 
     @app.exception_handler(RequestValidationError)
     async def invalid_request(request: object, error: RequestValidationError) -> JSONResponse:
@@ -170,7 +203,9 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
         LOGGER.error("API operation failed (%s)", type(error).__name__)
         return JSONResponse({"detail": "Internal operation failed"}, status_code=500)
 
-    @app.post("/train", response_model=ComparisonResult, dependencies=[Depends(authenticate)])
+    # Security declares the header in OpenAPI. The middleware is the single auth
+    # boundary for every POST, including malformed JSON and unknown POST paths.
+    @app.post("/train", response_model=ComparisonResult, dependencies=[Security(header)])
     def train(body: TrainRequest) -> ComparisonResult:
         if not operation.acquire(blocking=False):
             raise HTTPException(409, "Another training or prediction operation is running")
@@ -185,7 +220,7 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
         finally:
             operation.release()
 
-    @app.post("/predict", response_model=PredictionResult, dependencies=[Depends(authenticate)])
+    @app.post("/predict", response_model=PredictionResult, dependencies=[Security(header)])
     def predict(body: PredictRequest) -> PredictionResult:
         if not operation.acquire(blocking=False):
             raise HTTPException(409, "Another training or prediction operation is running")
@@ -205,18 +240,42 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
             operation.release()
 
     @app.get("/health/live")
-    def live() -> dict[str, str]:
+    async def live() -> dict[str, str]:
         return {"status": "alive"}
 
-    @app.get("/health/ready")
-    def ready() -> dict[str, str]:
+    def check_registry() -> None:
         # Explicit client routing avoids fluent-state interference with a running
-        # training operation. Readiness never downloads the model or grabs the guard.
+        # training operation. A private worker keeps blocked probes out of the
+        # shared pool used for authentication, prediction, and training handlers.
         try:
             client = MlflowClient(tracking_uri=settings.tracking_uri, registry_uri=settings.tracking_uri)
             resolve_champion(client, model_name)
-        except Exception as error:
+        finally:
+            probe.release()
+
+    def release_cancelled_probe(future: Future[None]) -> None:
+        # Cancellation can win before the worker starts; in that case its finally
+        # block will never run. A running probe releases the lease itself.
+        if future.cancelled():
+            probe.release()
+
+    @app.get("/health/ready")
+    async def ready() -> dict[str, str]:
+        if not probe.acquire(blocking=False):
+            raise HTTPException(503, "A registry readiness probe is already running")
+        try:
+            future = probe_worker.submit(check_registry)
+            future.add_done_callback(release_cancelled_probe)
+        except RuntimeError as error:
+            probe.release()
             raise HTTPException(503, "Champion registry is not ready") from error
+        try:
+            await asyncio.wait_for(asyncio.wrap_future(future), timeout=READINESS_TIMEOUT)
+        except (UnavailableError, MlflowException, OSError, TimeoutError) as error:
+            raise HTTPException(503, "Champion registry is not ready") from error
+        except Exception as error:
+            LOGGER.error("Readiness failed (%s)", type(error).__name__)
+            raise HTTPException(500, "Internal readiness operation failed") from error
         return {"status": "ready"}
 
     return app

@@ -318,7 +318,8 @@ def test_champion_policy_rollback_and_recovery_http(
         assert promote(first).decision == "retained"  # exact tie
         assert len(client.search_model_versions(f"name = '{name}'")) == 1
         client.log_metric(second.winner.run_id, "oof_mae", 3.0)
-        assert promote(second).decision == "retained"
+        retained = promote(second)
+        assert retained.decision == "retained", retained
         assert len(client.search_model_versions(f"name = '{name}'")) == 1
         client.log_metric(second.winner.run_id, "oof_mae", 1.0)
         better = promote(second)
@@ -420,6 +421,29 @@ def test_champion_policy_rollback_and_recovery_http(
         assert uncertain.decision == "failed" and not uncertain.confirmed
         assert client.get_registered_model(name).tags[promotion.PENDING] == uncertain.run_id
         assert promotion.champion_version(client, name) == uncertain.candidate_version
+
+        # A separate API reader must not serve the transient new alias or repair
+        # it itself. The durable marker protects serving after the writer dies too.
+        api_params = tmp_path / "pending-api.yaml"
+        api_params.write_text(
+            f"train:\n  experiment_name: promotion-comparisons\n  promotion:\n" f"    registered_model_name: {name}\n"
+        )
+        with monkeypatch.context() as patch:
+            patch.setattr(api, "PARAMS_PATH", api_params)
+            patch.setattr(tracking, "PROMOTION_LOCK", lock)
+            key = "pending-promotion-api-test-key-only"
+            application = api.create_app(api.APISettings(tracking_uri=uri, api_key=SecretStr(key)))
+            with TestClient(application) as http:
+                for _ in range(2):
+                    response = http.post(
+                        "/predict",
+                        json={"records": [{"age": 60, "sex": 0, "test_time": 0}]},
+                        headers={"X-API-Key": key},
+                    )
+                    assert response.status_code == 503
+                assert http.get("/health/ready").status_code == 503
+                assert client.get_registered_model(name).tags[promotion.PENDING] == uncertain.run_id
+
         client.log_metric(second.winner.run_id, "oof_mae", 3.0)
         assert promote(second).decision == "retained"
         assert promotion.champion_version(client, name) == old
@@ -499,6 +523,14 @@ def test_api_training_and_logged_immutable_inference_http(
     frame = pd.read_csv(prepared_directory / "train.csv").loc[:2, list(CANDIDATE_FEATURES)]
     records = [{name: float(row[name]) for name in CANDIDATE_FEATURES} for _, row in frame.iterrows()]
     records[0]["test_time"] = -3.0
+    downloads: list[Path] = []
+    original_download = inference.download_artifacts
+
+    def download(*, artifact_uri: str, dst_path: str) -> str:
+        downloads.append(Path(dst_path))
+        return original_download(artifact_uri=artifact_uri, dst_path=dst_path)
+
+    monkeypatch.setattr(inference, "download_artifacts", download)
     with running_server(tmp_path / "server", free_port()) as uri:
         application = api.create_app(api.APISettings(tracking_uri=uri, api_key=SecretStr(key)))
         client = mlflow.MlflowClient(tracking_uri=uri, registry_uri=uri)
@@ -511,8 +543,11 @@ def test_api_training_and_logged_immutable_inference_http(
             comparison = trained.json()
             assert comparison["promotion"]["decision"] == "promoted"
             assert http.get("/health/ready").status_code == 200
+            previous_path = list(sys.path)
             response = http.post("/predict", json={"records": records}, headers=headers)
             assert response.status_code == 200, response.text
+            assert sys.path == previous_path and len(downloads) == 1
+            assert not downloads[-1].exists()
             result = response.json()
             first_version = result["model_version"]
             run = client.get_run(result["run_id"])
@@ -546,9 +581,14 @@ def test_api_training_and_logged_immutable_inference_http(
                 tags={name: origin.data.tags[name] for name in promotion.IDENTITIES},
             )
             client.set_registered_model_alias("api-model", "champion", second_version.version)
+            with promotion.promotion_lock(tracking.PROMOTION_LOCK):
+                blocked = http.post("/predict", json={"records": records}, headers=headers)
+                assert blocked.status_code == 503
+            previous_path = list(sys.path)
             response = http.post("/predict", json={"records": records}, headers=headers)
             assert response.status_code == 200 and response.json()["model_version"] == second_version.version
             assert response.json()["model_version"] != first_version
+            assert sys.path == previous_path and not downloads[-1].exists()
             assert client.get_run(result["run_id"]).data.tags["model_version"] == first_version
 
             # A failed artifact upload cannot produce an optimistic success or a
@@ -575,6 +615,7 @@ def test_api_training_and_logged_immutable_inference_http(
                 patch.setattr(inference, "load_model", bad_artifact)
                 failed = http.post("/predict", json={"records": records}, headers=headers)
                 assert failed.status_code == 500 and "private" not in failed.text
+                assert not downloads[-1].exists()
                 # Readiness intentionally checks registry metadata, not downloads.
                 assert http.get("/health/ready").status_code == 200
 

@@ -304,13 +304,15 @@ example, and the **Authorize** control for the `X-API-Key` header.
 | `POST /train` | API key | Synchronously run the server's configured comparison and promotion policy |
 | `POST /predict` | API key | Predict one bounded batch with the current immutable champion version |
 | `GET /health/live` | None | Lightweight process check; no MLflow calls |
-| `GET /health/ready` | None | Check champion registry metadata; does not download artifacts |
+| `GET /health/ready` | None | Check champion registry metadata in one bounded probe; does not download artifacts |
 
 The application reads repository-owned `params.yaml` once when it starts; restart
 after changing settings or feature selections. Prepared data comes from the fixed
 `data/processed/` directory. Clients cannot override paths, feature selections,
 registered model names, aliases, or model URIs. Startup never trains automatically,
 and a missing champion leaves prediction/readiness unavailable while training remains usable.
+An unconfirmed promotion intent likewise blocks prediction and readiness until a later
+promotion reconciles it; the service never serves a transient alias.
 
 Run training with an empty JSON request:
 
@@ -351,16 +353,21 @@ No measurements are silently dropped; predictions retain request order.
 
 The default limit is 1,000 records; `PARKINSONS_MAX_BATCH_SIZE` can lower it to any
 integer from 1 to 1,000. Actual POST body bytes, including chunked bodies, are capped
-at 1 MiB before JSON parsing. Responses are `401` for invalid keys, `413` for
-oversized bodies, `422` for invalid inputs, `409` when another operation is busy,
+at 1 MiB before JSON parsing. Authentication happens first, so unauthenticated
+requests are rejected without reading their bodies. Responses are `401` for invalid
+keys, `408` for a stalled upload, `413` for oversized bodies, `422` for invalid inputs,
+`409` when another operation is busy,
 `503` for unavailable champion/MLflow dependencies, and `500` for invalid model
 artifacts or unexpected internal failures. Error responses do not echo request data
 or internal tracebacks.
 
 One nonblocking in-process guard serializes training and prediction; overlapping
-operations fail immediately rather than queueing. Health endpoints remain available.
-Use one worker/replica: the guard does not coordinate multiple API workers. The
-existing promotion file lock still protects registry updates across single-host processes.
+operations fail immediately rather than queueing. Health endpoints remain available:
+liveness does no I/O, and readiness allows one probe at a time with a three-second
+response deadline so a stalled registry cannot exhaust request workers.
+Use one worker/replica: the guard does not coordinate multiple API workers. Champion
+reads share the existing promotion file lock, which also protects registry updates
+across single-host processes.
 No background jobs, automatic request retries, or model cache are added. MLflow SDK
 network retry/timeout behavior follows its environment settings; the startup example
 uses zero retries and a ten-second per-request timeout, not a total training deadline.

@@ -34,11 +34,12 @@ PENDING = "pending_promotion_run_id"
 
 
 @contextmanager
-def promotion_lock(path: Path) -> Generator[None]:
-    """Serialize only registry work, not training; never unlink a lock in use."""
+def promotion_lock(path: Path, *, shared: bool = False) -> Generator[None]:
+    """Guard registry updates/read snapshots, not training; never unlink the file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        mode = fcntl.LOCK_SH if shared else fcntl.LOCK_EX
+        fcntl.flock(lock, mode | fcntl.LOCK_NB)
         try:
             yield
         finally:
