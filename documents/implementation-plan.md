@@ -4,7 +4,8 @@
 
 - The installable `src/parkinsons_ml/` package, preprocessing, experimentation, and
   tracking modules exist. Add API and monitoring modules as those services are implemented.
-- Define typed settings for MLflow, dataset paths, API authentication, and batch limits.
+- Typed API settings cover MLflow, API authentication, and batch limits; data/parameter
+  paths remain server-owned. Add monitoring configuration only as needed.
 - The initial GitHub Actions workflow covers hooks, tests, coverage, lock/export
   consistency, and dependency compatibility. Verify its first hosted run and enable
   the required merge check; extend the same workflow with Docker/deployment checks.
@@ -24,7 +25,7 @@ references. See README for commands and the data dictionary for policy. Remainin
 - Localhost MLflow setup with persistent SQLite metadata and HTTP-served local
   artifacts is documented in README. Real HTTP artifact/model round-trip,
   registry, restart, and failure integration tests cover the existing pipelines.
-- Remaining: configure clients in the API/dashboard paths and
+- Remaining: configure clients in the dashboard paths and
   migrate the same storage design to persistent Docker volumes during deployment.
 - Use MLflow for training records, model registry, inference batches, and monitoring
   reports. Do not introduce a separate audit database or monitoring API.
@@ -38,7 +39,8 @@ pooled out-of-fold selection, all-configuration refits, HTTP MLflow logging/relo
 checks, and typed results. `experimentation` owns evaluation and `training` owns
 pipeline construction. See README for the module boundaries, CLI, and policy.
 
-- Reuse this function from `/train` and bootstrap without invoking the CLI.
+- Reuse this function from deployment bootstrap without invoking the CLI; `/train`
+  already uses it directly.
 - Define explicit build provenance before supporting training from installed wheels
   or deployment images without their own Git source checkout.
 - Implement a separate final-test assessment operation; keep test data out of
@@ -52,25 +54,21 @@ Automatic strict-MAE promotion, immutable registry validation, a promotion-only
 single-host guard, alias rollback, and limited interrupted-update reconciliation
 are implemented. See README for configuration, audit records, and limitations.
 
-- Each future prediction must resolve `champion` once and load that exact version;
-  do not introduce a second active-model pointer. Add an immutable-version cache
-  only if measured latency requires it.
-- Expose promotion decisions separately from completed training in the API/UI.
+- Prediction resolves `champion` once per batch and loads that exact version.
+  Add an immutable-version cache only if measured latency requires it; keep the alias
+  as the sole deployment pointer.
+- Expose the existing separate API promotion outcome in the future dashboard.
 - Capture genuine operational evidence and document reviewed manual alias changes
   without bypassing unresolved promotion intents or comparability checks.
 
 ## 6. Expose training and logged prediction through FastAPI
 
-- Implement authenticated `POST /train`, bounded `POST /predict`, liveness/readiness
-  endpoints, and Swagger examples. Accept approved configuration, not arbitrary paths.
-- Use synchronous training and one API worker/replica. Return run/request IDs,
-  model identity, and training metrics/promotion decisions where applicable.
-- Create one inference run per request batch. Save validated pre-imputation inputs
-  and predictions as MLflow artifacts, with timestamp, latency, schema version,
-  and resolved model version. Avoid unnecessary patient identifiers or secrets.
-- Complete required logging before returning success. Define validation, missing-model,
-  dependency/logging-failure, and concurrent-training responses; do not silently
-  succeed with an unlogged prediction. Mark incomplete runs as failed.
+Authenticated synchronous training/prediction, bounded bodies/batches, the single-worker
+busy guard, health endpoints, Swagger examples, immutable champion loading, and
+required inference logging are implemented. See README for startup, contracts, and limitations.
+
+- Capture genuine development-system API request/training/prediction evidence.
+- Integrate API health/authentication into deployment checks when Compose exists.
 
 ## 7. Build monitoring directly from MLflow
 

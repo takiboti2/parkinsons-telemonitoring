@@ -17,6 +17,8 @@ import mlflow
 import numpy as np
 import pandas as pd
 import pytest
+from fastapi.testclient import TestClient
+from pydantic import SecretStr
 from mlflow.exceptions import MlflowException
 from mlflow.models import get_model_info
 from mlflow.sklearn import load_model, log_model
@@ -24,7 +26,7 @@ from mlflow.tracking.fluent import ActiveModelContext
 from mlflow.utils.thread_utils import ThreadLocalVariable
 from sklearn.linear_model import LinearRegression
 
-from parkinsons_ml import experimentation, promotion, tracking, training
+from parkinsons_ml import api, experimentation, inference, promotion, tracking, training
 from parkinsons_ml.schema import BASELINE_FEATURES, CANDIDATE_FEATURES
 from parkinsons_ml.training import FeaturePreparation, build_pipeline
 
@@ -469,6 +471,112 @@ def test_automatic_promotion_only_after_finished_training_http(
             completed = tracking.run_experiment(config, prepared_directory, uri)
         assert completed.promotion is not None and completed.promotion.decision == "failed"
         assert client.get_run(completed.run_id).info.status == "FINISHED"
+
+
+def test_api_training_and_logged_immutable_inference_http(
+    tmp_path: Path,
+    prepared_directory: Path,
+    http_tracking_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    parameters = tmp_path / "api-params.yaml"
+    parameters.write_text(
+        "train:\n  experiment_name: api-integration\n  promotion:\n"
+        "    enabled: true\n    registered_model_name: api-model\n"
+    )
+    monkeypatch.setattr(api, "PARAMS_PATH", parameters)
+    monkeypatch.setattr(api, "DATA_DIRECTORY", prepared_directory)
+    monkeypatch.setattr(tracking, "PROMOTION_LOCK", tmp_path / "api-promotion.lock")
+    original_read = Path.read_bytes
+
+    def read(path: Path) -> bytes:
+        assert path.name != "test.csv"
+        return original_read(path)
+
+    monkeypatch.setattr(Path, "read_bytes", read)
+    key = "isolated-http-api-key-not-a-real-secret"
+    headers = {"X-API-Key": key}
+    frame = pd.read_csv(prepared_directory / "train.csv").loc[:2, list(CANDIDATE_FEATURES)]
+    records = [{name: float(row[name]) for name in CANDIDATE_FEATURES} for _, row in frame.iterrows()]
+    records[0]["test_time"] = -3.0
+    with running_server(tmp_path / "server", free_port()) as uri:
+        application = api.create_app(api.APISettings(tracking_uri=uri, api_key=SecretStr(key)))
+        client = mlflow.MlflowClient(tracking_uri=uri, registry_uri=uri)
+        with TestClient(application) as http:
+            assert http.get("/health/live").status_code == 200
+            assert http.get("/health/ready").status_code == 503
+            assert http.post("/predict", json={"records": records}, headers=headers).status_code == 503
+            trained = http.post("/train", json={}, headers=headers)
+            assert trained.status_code == 200, trained.text
+            comparison = trained.json()
+            assert comparison["promotion"]["decision"] == "promoted"
+            assert http.get("/health/ready").status_code == 200
+            response = http.post("/predict", json={"records": records}, headers=headers)
+            assert response.status_code == 200, response.text
+            result = response.json()
+            first_version = result["model_version"]
+            run = client.get_run(result["run_id"])
+            assert run.info.status == "FINISHED" and run.data.tags["purpose"] == "inference"
+            assert run.data.tags["request_id"] == result["request_id"]
+            assert run.data.tags["model_version"] == first_version and run.data.metrics["batch_size"] == 3
+            with tracking.tracking_context(uri):
+                model = load_model(f"models:/api-model/{first_version}")
+                assert model is not None
+                expected = model.predict(pd.DataFrame(records))
+            np.testing.assert_allclose(result["predictions"], expected)
+            inputs = pd.read_csv(client.download_artifacts(result["run_id"], "inputs.csv", str(tmp_path)))
+            assert tuple(inputs.columns) == model.named_steps["features"].features
+            assert inputs.loc[0, "test_time"] == 0.0
+            predictions = pd.read_csv(client.download_artifacts(result["run_id"], "predictions.csv", str(tmp_path)))
+            assert predictions["row"].tolist() == [0, 1, 2]
+            np.testing.assert_allclose(predictions["prediction"], result["predictions"])
+
+            # Switch to the already-evaluated other configuration. No application
+            # restart or cache invalidation should be needed for the next request.
+            other = next(
+                item for item in comparison["configurations"] if item["run_id"] != comparison["winner"]["run_id"]
+            )
+            logged = client.get_logged_model(other["model_uri"].removeprefix("models:/"))
+            origin = client.get_run(other["run_id"])
+            second_version = client.create_model_version(
+                "api-model",
+                logged.artifact_location,
+                run_id=other["run_id"],
+                model_id=logged.model_id,
+                tags={name: origin.data.tags[name] for name in promotion.IDENTITIES},
+            )
+            client.set_registered_model_alias("api-model", "champion", second_version.version)
+            response = http.post("/predict", json={"records": records}, headers=headers)
+            assert response.status_code == 200 and response.json()["model_version"] == second_version.version
+            assert response.json()["model_version"] != first_version
+            assert client.get_run(result["run_id"]).data.tags["model_version"] == first_version
+
+            # A failed artifact upload cannot produce an optimistic success or a
+            # FINISHED inference record. Failure also releases the API guard.
+            original_log = mlflow.MlflowClient.log_text
+
+            def fail_upload(self: mlflow.MlflowClient, run_id: str, text: str, artifact_file: str) -> None:
+                if artifact_file == "predictions.csv":
+                    raise ConnectionError("private dependency details")
+                original_log(self, run_id, text, artifact_file)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(mlflow.MlflowClient, "log_text", fail_upload)
+                failed = http.post("/predict", json={"records": records}, headers=headers)
+            assert failed.status_code == 503 and "private" not in failed.text
+            runs = client.search_runs([run.info.experiment_id], "tags.purpose = 'inference'")
+            assert any(item.info.status == "FAILED" for item in runs)
+            assert http.post("/predict", json={"records": records}, headers=headers).status_code == 200
+
+            def bad_artifact(model_uri: str) -> None:
+                raise ValueError("private artifact error")
+
+            with monkeypatch.context() as patch:
+                patch.setattr(inference, "load_model", bad_artifact)
+                failed = http.post("/predict", json={"records": records}, headers=headers)
+                assert failed.status_code == 500 and "private" not in failed.text
+                # Readiness intentionally checks registry metadata, not downloads.
+                assert http.get("/health/ready").status_code == 200
 
 
 @pytest.mark.parametrize(

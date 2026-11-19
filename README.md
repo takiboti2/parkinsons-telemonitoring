@@ -5,8 +5,8 @@ Predict `motor_UPDRS` with scikit-learn's `LinearRegression`. The baseline uses
 `total_UPDRS` and use `subject#` only for patient-disjoint evaluation.
 
 **Status:** dependencies, hooks, notebook Git tools, DVC preparation, reusable model
-pipelines, MLflow-tracked experimentation, a local persistent MLflow setup, and CI
-are implemented. FastAPI/Streamlit services and Docker deployment remain.
+pipelines, MLflow-tracked experimentation, a local persistent MLflow setup, CI,
+and the authenticated FastAPI service are implemented. Streamlit and Docker deployment remain.
 This is not a clinical diagnostic service.
 
 ## Development setup
@@ -158,6 +158,8 @@ The implementation is split by responsibility:
 | `src/parkinsons_ml/experimentation.py` | Configuration, prepared snapshot validation, grouped evaluation, metrics, result types |
 | `src/parkinsons_ml/tracking.py` | MLflow orchestration, artifacts, lineage, repository checks, CLI |
 | `src/parkinsons_ml/promotion.py` | Registry eligibility, immutable-version validation, guarded alias updates and rollback |
+| `src/parkinsons_ml/inference.py` | Champion resolution, input validation, prediction and required inference logging |
+| `src/parkinsons_ml/api.py` | API settings, authentication, bounded schemas, routes and busy responses |
 
 For Python callers, use the owning modules directly:
 
@@ -271,8 +273,108 @@ update. Do not clear the marker merely to bypass a failure; first verify the ali
 and recorded old/new versions. There is no queue, scheduler, second deployment
 pointer, additional database, or general workflow-recovery framework.
 
-The alias is the deployment selection only; API/model-serving activation is not
-implemented yet. Registered artifacts and writers must be trusted.
+The alias is the only deployment selection. The API resolves it once per prediction
+batch and loads that exact version, without an application model cache. Registered
+artifacts and writers must be trusted.
+
+## FastAPI service
+
+Start MLflow first in its own terminal. In another terminal, set the connection and
+a secret API key of at least 32 characters, then start **one worker**:
+
+```bash
+export MLFLOW_TRACKING_URI="http://127.0.0.1:5000"
+export PARKINSONS_API_KEY="$(uv run --frozen python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+export MLFLOW_HTTP_REQUEST_MAX_RETRIES=0
+export MLFLOW_HTTP_REQUEST_TIMEOUT=10
+uv run --frozen uvicorn parkinsons_ml.api:create_app --factory \
+  --host 127.0.0.1 --port 8000 --workers 1
+```
+
+Keep that key private and reuse it for client requests. The service requires an
+explicit MLflow URI and API key; it does not load `.env`. Plain HTTP MLflow URIs
+are restricted to loopback as with CLI training. Do not expose the API publicly
+without HTTPS and appropriate deployment controls. CORS is not enabled.
+
+Open <http://127.0.0.1:8000/docs> for Swagger schemas, a full-feature prediction
+example, and the **Authorize** control for the `X-API-Key` header.
+
+| Endpoint | Authentication | Behavior |
+| --- | --- | --- |
+| `POST /train` | API key | Synchronously run the server's configured comparison and promotion policy |
+| `POST /predict` | API key | Predict one bounded batch with the current immutable champion version |
+| `GET /health/live` | None | Lightweight process check; no MLflow calls |
+| `GET /health/ready` | None | Check champion registry metadata; does not download artifacts |
+
+The application reads repository-owned `params.yaml` once when it starts; restart
+after changing settings or feature selections. Prepared data comes from the fixed
+`data/processed/` directory. Clients cannot override paths, feature selections,
+registered model names, aliases, or model URIs. Startup never trains automatically,
+and a missing champion leaves prediction/readiness unavailable while training remains usable.
+
+Run training with an empty JSON request:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8000/train \
+  -H "X-API-Key: $PARKINSONS_API_KEY" -H 'Content-Type: application/json' -d '{}'
+```
+
+The response contains the normal comparison result and a separate `promotion`
+outcome. Completed training returns success even when promotion is retained,
+rejected, or fails; inspect that field before assuming the champion changed.
+Do not automatically retry a timed-out training request: first inspect MLflow,
+because the original comparison may have completed.
+
+Submit canonical predictor names, for example all 19 predictors so the same
+client payload remains valid when the champion's selected subset changes:
+
+```bash
+curl --fail-with-body http://127.0.0.1:8000/predict \
+  -H "X-API-Key: $PARKINSONS_API_KEY" -H 'Content-Type: application/json' -d '{
+    "records": [{
+      "age": 65, "sex": 0, "test_time": 10,
+      "jitter": 0.004, "jitter_abs": 0.00003, "jitter_rap": 0.002,
+      "jitter_ppq5": 0.002, "jitter_ddp": 0.006,
+      "shimmer": 0.03, "shimmer_db": 0.3, "shimmer_apq3": 0.02,
+      "shimmer_apq5": 0.02, "shimmer_apq11": 0.025, "shimmer_dda": 0.06,
+      "nhr": 0.02, "hnr": 20, "rpde": 0.5, "dfa": 0.65, "ppe": 0.2
+    }]
+  }'
+```
+
+Every record must contain all selected features. Explicit `null` values are
+allowed for learned imputation, but omitted selected fields are rejected. Additional
+canonical predictors are validated and discarded if unused. Strings, booleans,
+nonfinite/unrepresentable numbers, invalid sex/age encodings, targets, subject IDs,
+and unknown keys are rejected. Time is zero-clipped using the pipeline's policy.
+No measurements are silently dropped; predictions retain request order.
+
+The default limit is 1,000 records; `PARKINSONS_MAX_BATCH_SIZE` can lower it to any
+integer from 1 to 1,000. Actual POST body bytes, including chunked bodies, are capped
+at 1 MiB before JSON parsing. Responses are `401` for invalid keys, `413` for
+oversized bodies, `422` for invalid inputs, `409` when another operation is busy,
+`503` for unavailable champion/MLflow dependencies, and `500` for invalid model
+artifacts or unexpected internal failures. Error responses do not echo request data
+or internal tracebacks.
+
+One nonblocking in-process guard serializes training and prediction; overlapping
+operations fail immediately rather than queueing. Health endpoints remain available.
+Use one worker/replica: the guard does not coordinate multiple API workers. The
+existing promotion file lock still protects registry updates across single-host processes.
+No background jobs, automatic request retries, or model cache are added. MLflow SDK
+network retry/timeout behavior follows its environment settings; the startup example
+uses zero retries and a ten-second per-request timeout, not a total training deadline.
+
+Each successful prediction response contains a request ID, inference run ID,
+registered model name, exact version, and predictions. One MLflow run per valid
+batch is tagged `purpose=inference`, with model/training/reference identities,
+batch size, timing, selected clipped **pre-imputation** inputs (`inputs.csv`), and
+row-aligned outputs (`predictions.csv`). Unused predictors, headers, and API keys
+are not saved. These artifacts are not anonymous merely because subject IDs are absent.
+Required logging must finish before a successful response; failed operations are
+marked failed where MLflow is reachable. Readiness checks registry availability,
+not artifact integrity or spare capacity; a ready service can still report busy or
+an artifact-loading error on a prediction request.
 
 ## MLflow tracking server
 

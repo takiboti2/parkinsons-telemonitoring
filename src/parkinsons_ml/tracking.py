@@ -6,7 +6,8 @@ import json
 import os
 import subprocess
 import sys
-from contextlib import redirect_stdout
+from collections.abc import Generator
+from contextlib import contextmanager, redirect_stdout
 from dataclasses import asdict, replace
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -204,9 +205,8 @@ def log_configuration(snapshot: TrainingSnapshot, selection: FeatureSet) -> Conf
     return ConfigurationResult(selection.name, selection.features, run.info.run_id, info.model_uri, evaluation.pooled)
 
 
-def run_experiment(config: TrainConfig, directory: Path, tracking_uri: str) -> ComparisonResult:
-    """Complete a comparison, then optionally promote its winner without final-test access."""
-    # TrainConfig validates itself at construction, including direct Python use.
+def validate_tracking_uri(tracking_uri: str) -> None:
+    """Apply the same explicit-server and transport rules to training and inference."""
     # Require an explicit server and keep embedded credentials/query values out of
     # URIs that MLflow may persist or display. No local tracking fallback is allowed.
     parsed = urlsplit(tracking_uri)
@@ -228,12 +228,12 @@ def run_experiment(config: TrainConfig, directory: Path, tracking_uri: str) -> C
             loopback = False
         if not loopback:
             raise ValueError("Remote MLflow servers require HTTPS; HTTP is allowed only for loopback hosts")
-    # Fluent MLflow can resume an environment-specified run even without an active
-    # context. Refuse both cases rather than taking ownership of a caller's run.
-    if mlflow.active_run() is not None or os.environ.get("MLFLOW_RUN_ID"):
-        raise ValueError("Cannot start comparison inside an unrelated active run")
-    # Repository/Git errors must not leave newly created experiments or failed runs.
-    validate_repository()
+
+
+@contextmanager
+def tracking_context(tracking_uri: str) -> Generator[mlflow.MlflowClient]:
+    """Route artifact/model loading to the explicit client server, then restore state."""
+    validate_tracking_uri(tracking_uri)
     # URI setters affect process state and environment variables. Save their prior
     # values so successful comparisons and failures both restore caller routing.
     old_tracking, old_registry = mlflow.get_tracking_uri(), mlflow.get_registry_uri()
@@ -242,6 +242,28 @@ def run_experiment(config: TrainConfig, directory: Path, tracking_uri: str) -> C
         mlflow.set_tracking_uri(tracking_uri)
         mlflow.set_registry_uri(tracking_uri)
         client = mlflow.MlflowClient(tracking_uri=tracking_uri, registry_uri=tracking_uri)
+        yield client
+    finally:
+        # Preserve unset environment variables as unset, not as getter defaults.
+        mlflow.set_tracking_uri(old_tracking)
+        mlflow.set_registry_uri(old_registry)
+        for key, value in environment.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def run_experiment(config: TrainConfig, directory: Path, tracking_uri: str) -> ComparisonResult:
+    """Complete a comparison, then optionally promote its winner without final-test access."""
+    validate_tracking_uri(tracking_uri)
+    # Fluent MLflow can resume an environment-specified run even without an active
+    # context. Refuse both cases rather than taking ownership of a caller's run.
+    if mlflow.active_run() is not None or os.environ.get("MLFLOW_RUN_ID"):
+        raise ValueError("Cannot start comparison inside an unrelated active run")
+    # Repository/Git errors must not leave newly created experiments or failed runs.
+    validate_repository()
+    with tracking_context(tracking_uri) as client:
         experiment = client.get_experiment_by_name(config.experiment_name)
         experiment_id = experiment.experiment_id if experiment else client.create_experiment(config.experiment_name)
         # HTTP tracking alone is insufficient: an existing experiment could still
@@ -294,16 +316,6 @@ def run_experiment(config: TrainConfig, directory: Path, tracking_uri: str) -> C
         # training success and has its own audit run; failures preserve training records.
         promotion = promote_winner(client, result, config.promotion, PROMOTION_LOCK)
         return replace(result, promotion=promotion)
-    finally:
-        # Restore routing even if server access, fitting, or artifact operations fail.
-        # Preserve unset environment variables as unset, not as getter defaults.
-        mlflow.set_tracking_uri(old_tracking)
-        mlflow.set_registry_uri(old_registry)
-        for key, value in environment.items():
-            if value is None:
-                os.environ.pop(key, None)
-            else:
-                os.environ[key] = value
 
 
 def main() -> None:
