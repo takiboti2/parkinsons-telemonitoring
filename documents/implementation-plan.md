@@ -72,14 +72,16 @@ required inference logging are implemented. See README for startup, contracts, a
 
 ## 7. Build monitoring directly from MLflow
 
-- Let Streamlit query MLflow and download completed inference-run artifacts for a
-  bounded recent window. Filter by compatible schema/model/reference identity.
-- Compare requests with a versioned development-data reference in the same
-  pre-imputation representation. Generate Evidently reports and save them to MLflow.
-- Show model identity, recent predictions, data quality, drift, and promotion decisions.
-  Handle empty/insufficient windows explicitly; label synthetic drift demonstrations.
-- Do not equate feature drift with performance degradation. Calculate performance
-  only with suitable ground truth; never promote solely because drift was detected.
+Bounded MLflow cohort loading, verified pre-imputation development references,
+on-demand Evidently reporting, required report persistence, and the thin Streamlit
+dashboard are implemented. See README for startup, limits, and interpretation.
+Synthetic data is confined to tests; no demonstration generator or traffic is added.
+
+- Capture genuine dashboard/monitoring evidence using actual completed inference runs.
+- Integrate dashboard startup and access controls into deployment work.
+- Performance monitoring remains unavailable until a suitable ground-truth label
+  collection/join policy is specified. Never infer performance loss or trigger
+  promotion from drift alone.
 
 ## 8. Make deployment reproducible with Compose
 

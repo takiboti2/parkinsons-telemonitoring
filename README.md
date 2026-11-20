@@ -160,6 +160,8 @@ The implementation is split by responsibility:
 | `src/parkinsons_ml/promotion.py` | Registry eligibility, immutable-version validation, guarded alias updates and rollback |
 | `src/parkinsons_ml/inference.py` | Champion resolution, input validation, prediction and required inference logging |
 | `src/parkinsons_ml/api.py` | API settings, authentication, bounded schemas, routes and busy responses |
+| `src/parkinsons_ml/monitoring.py` | Bounded compatible inference cohorts, Evidently reports, monitoring audit artifacts |
+| `src/parkinsons_ml/dashboard.py` | Streamlit controls, provenance, quality/drift displays, saved reports and promotion history |
 
 For Python callers, use the owning modules directly:
 
@@ -387,6 +389,77 @@ Required logging must finish before a successful response; failed operations are
 marked failed where MLflow is reachable. Readiness checks registry availability,
 not artifact integrity or spare capacity; a ready service can still report busy or
 an artifact-loading error on a prediction request.
+
+## Streamlit monitoring dashboard
+
+Start MLflow and the API first and create actual prediction batches through `/predict`.
+The dashboard reads MLflow directly; it does not train, serve predictions, or need the
+API key. In another terminal:
+
+```bash
+export MLFLOW_TRACKING_URI="http://127.0.0.1:5000"
+export MLFLOW_HTTP_REQUEST_MAX_RETRIES=0
+export MLFLOW_HTTP_REQUEST_TIMEOUT=10
+uv run --frozen streamlit run src/parkinsons_ml/dashboard.py \
+  --server.address 127.0.0.1 --server.port 8501
+```
+
+Open <http://127.0.0.1:8501>. Tracking settings come from the environment without
+dotenv loading; the registered model name comes from `params.yaml`. Keep the dashboard
+local: it has no separate authentication and can display sensitive measurements and
+write monitoring reports. External deployment requires access controls and TLS.
+
+Select an immutable model version (champion by default), then **Refresh window**.
+The selector lists up to 100 recent versions plus the independently resolved champion,
+so an older champion remains available even when it falls outside that history.
+The default lookback is 24 hours, adjustable to 1–168 hours. A fixed UTC cutoff
+selects completed inference runs in the selected training experiment. At most 100
+recent batches are scanned, using bounded pagination; at most 10,000 rows are
+included, always as whole batches. The dashboard shows the actual included time
+range, incompatible-batch count, and truncation. A busy model's traffic can consume
+the scan limit before older traffic for another model version is reached.
+
+Only batches with matching model version, training/reference run, dataset/split,
+schema/policy/evaluation identities, feature selection, and representation are combined.
+CSV record widths are checked before parsing; missing/extra fields cannot be silently
+padded or interpreted as an index. Inputs and predictions are checked for row alignment
+and valid values. The reference
+is the selected model's saved **development-data** reference; its checksum and
+metadata are verified. Corrupt compatible artifacts block reporting rather than
+being silently skipped. Artifact files are limited to 8 MiB before parsing.
+Neither the dashboard nor monitoring reads `test.csv` or loads a serialized model.
+
+**Generate and save report** runs Evidently and creates a separate MLflow run tagged
+`purpose=monitoring`. Normal refreshes, widget reruns, and opening saved reports do
+not create runs. Reports contain a cohort/window manifest with exact batch IDs and
+checksums, a quality/drift summary, and Evidently JSON/HTML when drift is evaluable.
+Required uploads must complete before success is displayed. Raw input CSVs are not
+duplicated into monitoring runs. Saved reports remain readable after restart.
+HTML is offered as a download, not embedded in the dashboard.
+Report policy `development-reference-drift-v2` binds the summary to the exact window
+manifest with a deterministic SHA-256 digest and validates row counts and sample
+configuration before saving or opening. This detects mismatched artifacts, not a
+malicious trusted-store writer. Older unbound reports remain in MLflow but are not
+accepted or listed by this reader; generate a new report with the current policy.
+
+Monitoring uses selected, clipped **pre-imputation** inputs. Missingness and
+distributions are reported separately from drift. Numerical features use normalized
+Wasserstein distance; `sex`, when selected, uses Jensen–Shannon distance. Both use
+a fixed 0.1 threshold; a drift signal requires at least 50% of evaluated features.
+Each feature needs at least 50 nonmissing rows in both datasets. Constant numerical
+reference columns and insufficient/all-missing columns are marked unavailable.
+Partial reports identify the unevaluated features; a low drift share is not proof
+that those features are stable. Methods, thresholds, library version, and sample
+requirements are saved with each report.
+
+The dashboard also shows recent prediction summaries, model provenance, pending
+promotions, promotion decisions/reasons, and saved reports. Measurement previews are
+opt-in and capped at 100 rows. Empty/insufficient windows are explicit, not “no drift.”
+Current performance is unavailable because inference batches have no ground-truth
+labels. Drift is a distribution signal, not evidence of performance degradation;
+repeated patient measurements and population changes can affect it. Nothing in
+monitoring triggers retraining or promotion. Synthetic stable/shifted/missing-data
+fixtures exist **only in tests**, never as demonstration traffic.
 
 ## MLflow tracking server
 

@@ -26,7 +26,7 @@ from mlflow.tracking.fluent import ActiveModelContext
 from mlflow.utils.thread_utils import ThreadLocalVariable
 from sklearn.linear_model import LinearRegression
 
-from parkinsons_ml import api, experimentation, inference, promotion, tracking, training
+from parkinsons_ml import api, experimentation, inference, monitoring, promotion, tracking, training
 from parkinsons_ml.schema import BASELINE_FEATURES, CANDIDATE_FEATURES
 from parkinsons_ml.training import FeaturePreparation, build_pipeline
 
@@ -551,7 +551,8 @@ def test_api_training_and_logged_immutable_inference_http(
         return original_download(artifact_uri=artifact_uri, dst_path=dst_path)
 
     monkeypatch.setattr(inference, "download_artifacts", download)
-    with running_server(tmp_path / "server", free_port()) as uri:
+    store, port = tmp_path / "server", free_port()
+    with running_server(store, port) as uri:
         application = api.create_app(api.APISettings(tracking_uri=uri, api_key=SecretStr(key)))
         client = mlflow.MlflowClient(tracking_uri=uri, registry_uri=uri)
         with TestClient(application) as http:
@@ -570,6 +571,25 @@ def test_api_training_and_logged_immutable_inference_http(
             assert not downloads[-1].exists()
             result = response.json()
             first_version = result["model_version"]
+            window = monitoring.load_window(client, "api-model", first_version, monitoring.WindowConfig(min_rows=2))
+            assert len(window.current) == len(records) and window.batches[0].run_id == result["run_id"]
+            report = monitoring.build_report(window)
+            saved_report = monitoring.save_report(client, window, report)
+            assert client.get_run(saved_report).info.status == "FINISHED"
+
+            original_report_upload = client.log_dict
+
+            def failed_report_upload(run_id: str, dictionary: dict[str, object], artifact_file: str) -> None:
+                if artifact_file == "summary.json":
+                    raise ConnectionError("required monitoring upload failed")
+                original_report_upload(run_id, dictionary, artifact_file)
+
+            with monkeypatch.context() as patch:
+                patch.setattr(client, "log_dict", failed_report_upload)
+                with pytest.raises(ConnectionError, match="required monitoring"):
+                    monitoring.save_report(client, window, report)
+            monitoring_runs = client.search_runs([window.cohort.experiment_id], "tags.purpose = 'monitoring'")
+            assert {item.info.status for item in monitoring_runs} == {"FINISHED", "FAILED"}
             run = client.get_run(result["run_id"])
             assert run.info.status == "FINISHED" and run.data.tags["purpose"] == "inference"
             assert run.data.tags["request_id"] == result["request_id"]
@@ -638,6 +658,120 @@ def test_api_training_and_logged_immutable_inference_http(
                 assert not downloads[-1].exists()
                 # Readiness intentionally checks registry metadata, not downloads.
                 assert http.get("/health/ready").status_code == 200
+
+    with running_server(store, port) as uri:
+        client = mlflow.MlflowClient(tracking_uri=uri, registry_uri=uri)
+        manifest, restored = monitoring.open_saved_report(client, window.cohort, saved_report)
+        assert manifest["batches"] == window.manifest()["batches"]
+        assert restored.summary == report.summary and restored.html is not None
+
+
+def test_monitoring_filters_time_status_cohort_and_pages_over_http(
+    tmp_path: Path,
+    prepared_directory: Path,
+    http_tracking_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(tracking, "PROMOTION_LOCK", tmp_path / "monitoring-promotion.lock")
+    config = experimentation.training_config(
+        {
+            "experiment_name": "monitoring-window",
+            "promotion": {"enabled": True, "registered_model_name": "monitoring-model"},
+        }
+    )
+    cutoff = 1800000000000
+    start = cutoff - 3600000
+    with running_server(tmp_path / "server", free_port()) as uri:
+        trained = tracking.run_experiment(config, prepared_directory, uri)
+        assert trained.promotion is not None and trained.promotion.candidate_version is not None
+        client = mlflow.MlflowClient(tracking_uri=uri, registry_uri=uri)
+        cohort = monitoring.load_cohort(client, "monitoring-model", trained.promotion.candidate_version)
+        reference = pd.read_csv(
+            client.download_artifacts(cohort.training_run_id, "monitoring/reference.csv", str(tmp_path))
+        )
+        tags = {
+            "purpose": "inference",
+            "registered_model_name": cohort.model_name,
+            "model_version": cohort.model_version,
+            "training_run_id": cohort.training_run_id,
+            "reference_run_id": cohort.training_run_id,
+            "reference_artifact": "monitoring/reference.csv",
+            "representation": monitoring.REPRESENTATION,
+            **cohort.identities,
+        }
+
+        def record(
+            timestamp: int,
+            end: int | None,
+            status: str = "FINISHED",
+            *,
+            value: int | None = None,
+            foreign: bool = False,
+            purpose: str = "inference",
+        ) -> str:
+            run = client.create_run(
+                cohort.experiment_id,
+                start_time=timestamp,
+                tags={**tags, "purpose": purpose, "model_version": "999" if foreign else cohort.model_version},
+            )
+            run_id = run.info.run_id
+            # Only valid, included batches have artifacts. Any filter regression
+            # must therefore either fail loading or violate the exact ID assertions.
+            if value is not None:
+                current = reference.iloc[:1].copy()
+                current["test_time"] = float(value + 10)
+                client.log_text(run_id, current.to_csv(index=False), "inputs.csv")
+                client.log_text(
+                    run_id,
+                    pd.DataFrame({"row": [0], "prediction": [float(value)]}).to_csv(index=False),
+                    "predictions.csv",
+                )
+                client.log_param(run_id, "features", ",".join(cohort.features))
+                client.log_metric(run_id, "batch_size", 1)
+            if status != "RUNNING":
+                client.set_terminated(run_id, status, end_time=end)
+            return run_id
+
+        included: list[str] = []
+        for index in range(30):
+            timestamp = start if index == 29 else cutoff - index * 1000
+            included.append(record(timestamp, timestamp, value=index))
+        record(start - 1, start + 100)  # started outside the lower boundary
+        record(cutoff + 1, cutoff + 1)  # starts after the cutoff
+        record(cutoff - 500, cutoff + 1)  # completed after the captured cutoff
+        record(cutoff - 500, None, "RUNNING")
+        record(cutoff - 500, cutoff, "FAILED")
+        record(cutoff - 500, cutoff, purpose="monitoring")
+        record(cutoff - 1500, cutoff, foreign=True)
+
+        window = monitoring.load_window(
+            client, cohort.model_name, cohort.model_version, monitoring.WindowConfig(hours=1), cutoff_ms=cutoff
+        )
+        assert [batch.run_id for batch in window.batches] == included
+        assert window.predictions["prediction"].tolist() == list(range(30))
+        assert window.current["test_time"].tolist() == list(range(10, 40))
+        assert window.scanned == 31 and window.incompatible == 1 and not window.truncated
+        assert window.manifest()["actual_start_ms"] == start
+        assert window.manifest()["actual_end_ms"] == cutoff
+        bounded = monitoring.load_window(
+            client,
+            cohort.model_name,
+            cohort.model_version,
+            monitoring.WindowConfig(hours=1, max_batches=25),
+            cutoff_ms=cutoff,
+        )
+        assert [batch.run_id for batch in bounded.batches] == included[:24]
+        assert bounded.scanned == 25 and bounded.incompatible == 1 and bounded.truncated
+        row_limited = monitoring.load_window(
+            client,
+            cohort.model_name,
+            cohort.model_version,
+            monitoring.WindowConfig(hours=1, max_rows=5),
+            cutoff_ms=cutoff,
+        )
+        assert [batch.run_id for batch in row_limited.batches] == included[:5]
+        assert row_limited.predictions["prediction"].tolist() == list(range(5))
+        assert row_limited.truncated
 
 
 @pytest.mark.parametrize(
