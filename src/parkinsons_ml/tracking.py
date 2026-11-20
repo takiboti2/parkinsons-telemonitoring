@@ -20,6 +20,7 @@ from mlflow.models import infer_signature
 from mlflow.sklearn import load_model, log_model
 from sklearn.pipeline import Pipeline
 
+from parkinsons_ml.artifacts import artifact_workspace
 from parkinsons_ml.experimentation import (
     EVALUATION_VERSION,
     ComparisonResult,
@@ -155,20 +156,23 @@ def log_configuration(snapshot: TrainingSnapshot, selection: FeatureSet) -> Conf
     validate_predictions(expected, (len(train),))
     # Serialize preprocessing together with LinearRegression and package custom code.
     # Keep the skops trust list narrow rather than trusting arbitrary loaded types.
-    info = log_model(
-        pipeline,
-        name="pipeline",
-        input_example=inputs.head(5),
-        signature=infer_signature(inputs, expected),
-        code_paths=[str(ROOT / "src/parkinsons_ml")],
-        skops_trusted_types=["numpy.dtype", "parkinsons_ml.training.FeaturePreparation"],
-    )
-    # Verify the uploaded model URI, not a local pickle or the in-memory estimator.
-    # A serialization/loading mismatch fails the child and therefore the comparison.
-    loaded = load_model(info.model_uri)
-    if not isinstance(loaded, Pipeline):
-        raise ValueError("Reloaded model must be a complete pipeline")
-    np.testing.assert_allclose(loaded.predict(inputs), expected, rtol=1e-12, atol=1e-12)
+    with artifact_workspace() as directory:
+        # log_model also loads local code while validating its serving example.
+        # Its own files are scoped by MLflow, but its import-path changes are not.
+        info = log_model(
+            pipeline,
+            name="pipeline",
+            input_example=inputs.head(5),
+            signature=infer_signature(inputs, expected),
+            code_paths=[str(ROOT / "src/parkinsons_ml")],
+            skops_trusted_types=["numpy.dtype", "parkinsons_ml.training.FeaturePreparation"],
+        )
+        # Verify the uploaded URI, not the in-memory estimator. A serialization
+        # mismatch fails the child and therefore the comparison.
+        loaded = load_model(info.model_uri, dst_path=directory)
+        if not isinstance(loaded, Pipeline):
+            raise ValueError("Reloaded model must be a complete pipeline")
+        np.testing.assert_allclose(loaded.predict(inputs), expected, rtol=1e-12, atol=1e-12)
     # Retain natural missingness before learned imputation for later drift analysis.
     # Hash the same CSV representation that is uploaded, with no patient identifier.
     reference_csv = inputs.to_csv(index=False)

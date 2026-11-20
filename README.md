@@ -365,6 +365,11 @@ One nonblocking in-process guard serializes training and prediction; overlapping
 operations fail immediately rather than queueing. Health endpoints remain available:
 liveness does no I/O, and readiness allows one probe at a time with a three-second
 response deadline so a stalled registry cannot exhaust request workers.
+That deadline does not cancel the underlying SDK call. Shutdown does not wait in
+the event loop, but Python still waits for a running probe thread before process
+exit. Keep the MLflow network timeout/retry settings above; use a service supervisor's
+termination deadline if a hard shutdown bound is required. No hard process-exit
+deadline is enforced by the API itself.
 Use one worker/replica: the guard does not coordinate multiple API workers. Champion
 reads share the existing promotion file lock, which also protects registry updates
 across single-host processes.

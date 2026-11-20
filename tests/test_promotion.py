@@ -1,6 +1,7 @@
 """Promotion contracts and failure boundaries independent of server availability."""
 
 import json
+import sys
 from pathlib import Path
 from typing import cast
 from unittest.mock import MagicMock
@@ -237,12 +238,18 @@ def test_immutable_version_validation(problem: str, tmp_path: Path, monkeypatch:
         "predictions/refit.csv": str(predictions),
     }
 
-    def download(run_id: str, path: str) -> str:
-        return paths[path]
+    downloads: list[Path] = []
+
+    def download(run_id: str, path: str, directory: str) -> str:
+        assert Path(directory).is_dir()
+        local = Path(directory) / Path(path).name
+        local.write_bytes(Path(paths[path]).read_bytes())
+        return str(local)
 
     client.download_artifacts.side_effect = download
 
     def load(uri: str) -> object:
+        sys.path.insert(0, str(Path(uri) / "code"))
         return None if problem == "not_pipeline" else pipeline
 
     info = MagicMock()
@@ -251,14 +258,22 @@ def test_immutable_version_validation(problem: str, tmp_path: Path, monkeypatch:
     def model_info(uri: str) -> object:
         return info
 
+    def download_model(*, artifact_uri: str, dst_path: str) -> str:
+        assert artifact_uri == "models:/model/1"
+        downloads.append(Path(dst_path))
+        return dst_path
+
+    monkeypatch.setattr(promotion, "download_artifacts", download_model)
     monkeypatch.setattr(promotion, "load_model", load)
-    monkeypatch.setattr(promotion, "get_model_info", model_info)
+    monkeypatch.setattr(promotion.Model, "load", model_info)
     record = promotion.EvaluationRecord(1.0, {}, ("sex",) if problem == "selection" else ("age",))
+    previous_path = list(sys.path)
     if problem == "none":
         promotion.validate_version(client, "model", "1", "run", record)
     else:
         with pytest.raises((ValueError, AssertionError)):
             promotion.validate_version(client, "model", "1", "run", record)
+    assert sys.path == previous_path and all(not path.exists() for path in downloads)
 
 
 def test_rollback_must_verify_restoration() -> None:

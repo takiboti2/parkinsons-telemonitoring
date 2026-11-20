@@ -142,10 +142,21 @@ def test_training_comparison_http(
         return original_read(path)
 
     monkeypatch.setattr(Path, "read_bytes", read)
+    downloads: list[Path] = []
+    original_load = tracking.load_model
+
+    def reload_model(model_uri: str, *, dst_path: str) -> object:
+        downloads.append(Path(dst_path))
+        return original_load(model_uri, dst_path=dst_path)
+
+    monkeypatch.setattr(tracking, "load_model", reload_model)
     with running_server(store, port) as uri:
         previous_uris = mlflow.get_tracking_uri(), mlflow.get_registry_uri()
         previous_environment = {key: os.environ.get(key) for key in ("MLFLOW_TRACKING_URI", "MLFLOW_REGISTRY_URI")}
+        previous_path = list(sys.path)
         result = training.run_experiment(config, prepared_directory, uri)
+        assert sys.path == previous_path
+        assert len(downloads) == 3 and all(not path.exists() for path in downloads)
         assert (mlflow.get_tracking_uri(), mlflow.get_registry_uri()) == previous_uris
         assert {key: os.environ.get(key) for key in previous_environment} == previous_environment
         client = mlflow.MlflowClient(tracking_uri=uri)
@@ -237,10 +248,15 @@ def test_training_failures_do_not_select_partial_winner(
         def fail(*args: object, **kwargs: object) -> None:
             raise RuntimeError("required operation failed")
 
-        def invalid_reload(uri: str) -> None:
+        downloads: list[Path] = []
+
+        def invalid_reload(uri: str, *, dst_path: str) -> None:
+            downloads.append(Path(dst_path))
+            sys.path.insert(0, str(Path(dst_path) / "code"))
             return None
 
         for operation in ("evaluate", "log_model", "load_model", "log_metrics", "log_text", "fit", "invalid_reload"):
+            previous_path = list(sys.path)
             with monkeypatch.context() as patch:
                 if operation == "invalid_reload":
                     patch.setattr(tracking, "load_model", invalid_reload)
@@ -252,6 +268,7 @@ def test_training_failures_do_not_select_partial_winner(
                 with pytest.raises((RuntimeError, ValueError)):
                     tracking.run_experiment(config, prepared_directory, uri)
             assert mlflow.active_run() is None
+            assert sys.path == previous_path and all(not path.exists() for path in downloads)
         experiment = client.get_experiment_by_name("failures")
         assert experiment is not None
         runs = client.search_runs([experiment.experiment_id])
@@ -308,7 +325,10 @@ def test_champion_policy_rollback_and_recovery_http(
         client.log_metric(second.winner.run_id, "oof_mae", 1.0)
 
         def promote(result: experimentation.ComparisonResult, model: str = name) -> experimentation.PromotionResult:
-            return promotion.promote_winner(client, result, experimentation.PromotionConfig(True, model), lock)
+            previous_path = list(sys.path)
+            outcome = promotion.promote_winner(client, result, experimentation.PromotionConfig(True, model), lock)
+            assert sys.path == previous_path
+            return outcome
 
         bootstrap = promote(first)
         assert bootstrap.decision == "promoted" and bootstrap.reason == "bootstrap"

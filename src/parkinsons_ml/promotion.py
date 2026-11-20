@@ -12,12 +12,14 @@ import numpy as np
 import pandas as pd
 from mlflow.entities import LoggedModelStatus
 from mlflow.exceptions import MlflowException
-from mlflow.models import get_model_info
+from mlflow.artifacts import download_artifacts
+from mlflow.models import Model
 from mlflow.sklearn import load_model
 from mlflow.tracking import MlflowClient
 from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline
 
+from parkinsons_ml.artifacts import artifact_workspace
 from parkinsons_ml.experimentation import (
     ComparisonResult,
     PromotionConfig,
@@ -116,7 +118,8 @@ def reconcile(client: MlflowClient, name: str) -> None:
         return
     if not pending:
         return
-    intent = json_mapping(Path(client.download_artifacts(pending, "intent.json")).read_bytes())
+    with artifact_workspace() as directory:
+        intent = json_mapping(Path(client.download_artifacts(pending, "intent.json", directory)).read_bytes())
     old, new = intent.get("previous_version"), intent.get("candidate_version")
     if (
         intent.get("registered_model_name") != name
@@ -152,33 +155,37 @@ def reconcile(client: MlflowClient, name: str) -> None:
 def validate_version(client: MlflowClient, name: str, version: str, run_id: str, record: EvaluationRecord) -> None:
     """Check the immutable registry version against already-saved refit artifacts."""
     uri = f"models:/{name}/{version}"
-    pipeline = load_model(uri)
-    if not isinstance(pipeline, Pipeline):
-        raise ValueError("Registered model is not a complete pipeline")
-    selector = pipeline.named_steps.get("features")
-    if (
-        tuple(pipeline.named_steps) != ("features", "imputation", "linearregression")
-        or not isinstance(selector, FeaturePreparation)
-        or selector.features != record.features
-        or type(pipeline.named_steps.get("linearregression")) is not LinearRegression
-    ):
-        raise ValueError("Registered pipeline does not match the approved model/selection")
-    signature = get_model_info(uri).signature
-    if signature is None or signature.inputs is None or signature.inputs.input_names() != list(record.features):
-        raise ValueError("Registered model signature differs from selected features")
-    reference_path = Path(client.download_artifacts(run_id, "monitoring/reference.csv"))
-    identity = json_mapping(Path(client.download_artifacts(run_id, "monitoring/identity.json")).read_bytes())
-    if identity.get("sha256") != digest(reference_path.read_bytes()):
-        raise ValueError("Monitoring reference checksum mismatch")
-    inputs = pd.read_csv(reference_path)
-    expected = pd.read_csv(client.download_artifacts(run_id, "predictions/refit.csv"))
-    if tuple(inputs.columns) != record.features or tuple(expected.columns) != ("prediction",):
-        raise ValueError("Unexpected refit verification columns")
-    predicted = np.asarray(pipeline.predict(inputs), dtype=np.float64)
-    validate_predictions(predicted, (len(inputs),))
-    values = expected["prediction"].to_numpy(dtype=np.float64)
-    validate_predictions(values, predicted.shape)
-    np.testing.assert_allclose(predicted, values, rtol=1e-10, atol=1e-10)
+    with artifact_workspace() as directory:
+        local = download_artifacts(artifact_uri=uri, dst_path=directory)
+        pipeline = load_model(local)
+        if not isinstance(pipeline, Pipeline):
+            raise ValueError("Registered model is not a complete pipeline")
+        selector = pipeline.named_steps.get("features")
+        if (
+            tuple(pipeline.named_steps) != ("features", "imputation", "linearregression")
+            or not isinstance(selector, FeaturePreparation)
+            or selector.features != record.features
+            or type(pipeline.named_steps.get("linearregression")) is not LinearRegression
+        ):
+            raise ValueError("Registered pipeline does not match the approved model/selection")
+        signature = Model.load(str(Path(local) / "MLmodel")).signature
+        if signature is None or signature.inputs is None or signature.inputs.input_names() != list(record.features):
+            raise ValueError("Registered model signature differs from selected features")
+        reference_path = Path(client.download_artifacts(run_id, "monitoring/reference.csv", directory))
+        identity = json_mapping(
+            Path(client.download_artifacts(run_id, "monitoring/identity.json", directory)).read_bytes()
+        )
+        if identity.get("sha256") != digest(reference_path.read_bytes()):
+            raise ValueError("Monitoring reference checksum mismatch")
+        inputs = pd.read_csv(reference_path)
+        expected = pd.read_csv(client.download_artifacts(run_id, "predictions/refit.csv", directory))
+        if tuple(inputs.columns) != record.features or tuple(expected.columns) != ("prediction",):
+            raise ValueError("Unexpected refit verification columns")
+        predicted = np.asarray(pipeline.predict(inputs), dtype=np.float64)
+        validate_predictions(predicted, (len(inputs),))
+        values = expected["prediction"].to_numpy(dtype=np.float64)
+        validate_predictions(values, predicted.shape)
+        np.testing.assert_allclose(predicted, values, rtol=1e-10, atol=1e-10)
 
 
 def promote_winner(

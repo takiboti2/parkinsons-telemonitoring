@@ -179,8 +179,9 @@ def create_app(settings: APISettings | None = None) -> FastAPI:
         try:
             yield
         finally:
-            # A timed-out SDK call cannot be killed safely. Never wait for it in
-            # the event loop or submit another probe while that call is running.
+            # This only keeps ASGI shutdown nonblocking: Python still joins a
+            # running executor thread at process exit. SDK network timeouts bound
+            # normal failures; a supervisor must enforce any hard exit deadline.
             probe_worker.shutdown(wait=False, cancel_futures=True)
 
     app = FastAPI(

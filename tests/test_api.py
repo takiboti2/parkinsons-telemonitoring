@@ -6,6 +6,7 @@ from pathlib import Path
 from threading import Event
 
 import pytest
+import httpx
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from pydantic import SecretStr, ValidationError
@@ -349,3 +350,36 @@ def test_readiness_programming_error_is_not_reported_as_an_outage(
     with TestClient(application) as client:
         response = client.get("/health/ready")
     assert response.status_code == 500 and "private" not in response.text
+
+
+def test_asgi_shutdown_does_not_wait_for_running_readiness(
+    application: FastAPI, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release, finished = Event(), Event()
+
+    def stalled(client: object, name: str) -> None:
+        try:
+            assert release.wait(5)
+        finally:
+            finished.set()
+
+    monkeypatch.setattr(api, "resolve_champion", stalled)
+    monkeypatch.setattr(api, "READINESS_TIMEOUT", 0.01)
+
+    async def exercise() -> None:
+        async with application.router.lifespan_context(application):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=application), base_url="http://test"
+            ) as client:
+                assert (await client.get("/health/ready")).status_code == 503
+        # ASGI shutdown returned, but it did not kill the running SDK call.
+        assert not finished.is_set()
+
+    async def bounded_shutdown() -> None:
+        await asyncio.wait_for(exercise(), timeout=1)
+
+    try:
+        asyncio.run(bounded_shutdown())
+    finally:
+        release.set()
+        assert finished.wait(5)
