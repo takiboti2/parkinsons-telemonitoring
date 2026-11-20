@@ -2,6 +2,6 @@
   "python.analysis.diagnosticMode": "openFilesOnly",
   "python.analysis.exclude": ["**/.venv/**"],
 
-  "python.analysis.disableBundledStubs": ["sklearn"],
+  "python.analysis.disableBundledStubs": ["sklearn", "numpy"],
   "python.analysis.useLibraryCodeForTypes": true
 }

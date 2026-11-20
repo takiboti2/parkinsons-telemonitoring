@@ -244,7 +244,7 @@ def test_pre_imputation_inputs_preserve_nulls_clip_time_and_drop_unused() -> Non
     ]
     frame = inference.prepare_inputs(records, ("age", "test_time"))
     assert tuple(frame.columns) == ("age", "test_time")
-    assert np.isnan(frame.iloc[0, 0]) and frame["test_time"].tolist() == [0.0, 3.0]
+    assert pd.isna(frame.iloc[0, 0]) and frame["test_time"].tolist() == [0.0, 3.0]
     with pytest.raises(inference.InputError, match="empty"):
         inference.prepare_inputs([], ("age",))
     with pytest.raises(inference.InputError, match="Every|Each"):
