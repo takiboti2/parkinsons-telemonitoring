@@ -6,7 +6,9 @@ Predict `motor_UPDRS` with scikit-learn's `LinearRegression`. The baseline uses
 
 **Status:** dependencies, hooks, notebook Git tools, DVC preparation, reusable model
 pipelines, MLflow-tracked experimentation, a local persistent MLflow setup, CI,
-and the authenticated FastAPI service are implemented. Streamlit and Docker deployment remain.
+the authenticated FastAPI service, and Streamlit/Evidently monitoring are implemented.
+Docker/Compose configuration and its CI smoke job are provided; container runtime
+verification still requires a Docker-capable runner.
 This is not a clinical diagnostic service.
 
 ## Development setup
@@ -141,7 +143,8 @@ uv run --frozen python -m parkinsons_ml.training
 
 An explicit HTTP/HTTPS URI is required; no filesystem fallback is used. Plain HTTP
 is accepted only for `localhost` or loopback IP addresses (including IPv6 `::1`);
-remote hosts require HTTPS and appropriately configured server access control.
+remote hosts require HTTPS and appropriately configured server access control, except
+for the explicit single-host Compose exception documented below.
 Tracking and model loading use that same server. The CLI prints a JSON result with
 parent and child run IDs, model URIs, validation metrics, identities, the winner,
 and a separate promotion decision.
@@ -162,6 +165,8 @@ The implementation is split by responsibility:
 | `src/parkinsons_ml/api.py` | API settings, authentication, bounded schemas, routes and busy responses |
 | `src/parkinsons_ml/monitoring.py` | Bounded compatible inference cohorts, Evidently reports, monitoring audit artifacts |
 | `src/parkinsons_ml/dashboard.py` | Streamlit controls, provenance, quality/drift displays, saved reports and promotion history |
+| `src/parkinsons_ml/provenance.py` | Hash-verified source-layout image provenance |
+| `src/parkinsons_ml/deployment.py` | Offline bundle verification and idempotent one-shot bootstrap |
 
 For Python callers, use the owning modules directly:
 
@@ -181,12 +186,12 @@ points remain as thin delegates, as does the documented training command.
 its `parkinsons_ml.training.FeaturePreparation` import path for saved models.
 Pipeline construction and evaluation do not import MLflow; tracking is the outer layer.
 
-Experimentation is deliberately **source-checkout-only**, not supported from an
-installed wheel. Git must be available, and the package must reside under its own
-Git checkout's `src/parkinsons_ml/`, alongside `uv.lock` and `pyproject.toml` at the
-repository root. These requirements are checked before contacting MLflow or creating
-runs, independently of the caller's working directory. For packaged deployment,
-explicit build provenance remains future work; no missing Git metadata is silently ignored.
+Experimentation requires the approved **source layout**, not an arbitrary installed
+wheel. Local development requires Git and its own checkout's `src/parkinsons_ml/`,
+alongside `uv.lock` and `pyproject.toml`. Docker images retain this layout but validate
+the explicit build-provenance manifest instead of requiring Git history. These
+requirements are checked before MLflow run creation, independently of the caller's
+working directory; missing Git metadata is never silently ignored.
 
 `params.yaml` always adds the baseline and full candidate. Optional configurations
 extend them, for example:
@@ -223,7 +228,7 @@ refits on all train data, logs and reload-verifies a complete pipeline, and save
 selected-feature-only signatures/examples, identifier-free prediction artifacts,
 and a checksummed pre-imputation monitoring reference. The parent records
 preparation/audit metadata separately, code/dependency hashes, Git revision/dirty
-status, comparison results, and selection. It does not upload the full training
+status or image-build provenance, comparison results, and selection. It does not upload the full training
 table or arbitrary working-tree files.
 
 Required fit, prediction, logging, artifact upload, or reload errors fail the
@@ -295,7 +300,7 @@ uv run --frozen uvicorn parkinsons_ml.api:create_app --factory \
 
 Keep that key private and reuse it for client requests. The service requires an
 explicit MLflow URI and API key; it does not load `.env`. Plain HTTP MLflow URIs
-are restricted to loopback as with CLI training. Do not expose the API publicly
+are restricted to loopback by default, as with CLI training. Do not expose the API publicly
 without HTTPS and appropriate deployment controls. CORS is not enabled.
 
 Open <http://127.0.0.1:8000/docs> for Swagger schemas, a full-feature prediction
@@ -460,6 +465,108 @@ labels. Drift is a distribution signal, not evidence of performance degradation;
 repeated patient measurements and population changes can affect it. Nothing in
 monitoring triggers retraining or promotion. Synthetic stable/shifted/missing-data
 fixtures exist **only in tests**, never as demonstration traffic.
+
+## Docker Compose deployment
+
+Requires Docker Engine with Compose v2 (including `--wait` support). Stop any local
+services already using ports 5000, 8000, and 8501. The stack uses three long-running
+services (MLflow, one-worker FastAPI, Streamlit) and a one-shot bootstrap task.
+No Airflow, external database, object store, or scheduler is added.
+
+### Prepare the offline data bundle
+
+On a machine with the canonical raw dataset already restored from DVC:
+
+```bash
+uv run --frozen python -m parkinsons_ml.deployment bundle --directory ./data-bundle
+```
+
+Alternatively, obtain this same directory from a trusted operator. It contains only
+`parkinsons_updrs.csv` and `manifest.json`. The Git-tracked
+`documents/data-bundle.json` pins the filename, size, SHA-256, dataset source, and
+DVC MD5. Bootstrap verifies both that pin and the DVC metadata, not merely the
+manifest supplied alongside the data. It refuses modified files, symlinked payloads,
+unexpected bundle contents, and an existing different raw dataset.
+
+The bundle is read-only delivery, not another dataset versioning system. Bootstrap
+copies verified raw bytes into persistent application data and runs existing
+preparation code. No access to the host-local DVC remote is required inside Docker.
+There is no unpinned download fallback. Do not mount an archive: supply the directory.
+The files must be readable by container UID 10001.
+
+### Build and start
+
+Use a committed, clean checkout so the declared build revision identifies the source
+being packaged. These commands do not commit changes:
+
+```bash
+test -z "$(git status --porcelain)" || { echo "Commit or preserve pending changes before building"; exit 1; }
+export SOURCE_REVISION="$(git rev-parse HEAD)"
+export DATA_BUNDLE_DIR="$(pwd)/data-bundle"
+export PARKINSONS_API_KEY="$(uv run --frozen python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+docker compose build bootstrap
+docker compose up --no-build --wait --wait-timeout 600
+```
+
+The Python 3.13 and uv base images are pinned by version and digest. The shared image
+uses `uv sync --frozen --no-dev`, excludes Git history, raw data, local storage,
+notebooks, credentials and host environments, and runs as a non-root user with a
+read-only root filesystem. API keys are supplied at runtime, never baked into an
+image. Keep environment files out of Git; Docker administrators can inspect container
+environment values.
+
+Training retains checkout validation for local development. Images instead include
+`build-provenance.json`, generated from the actual packaged source, dependency,
+configuration and dataset-metadata hashes. Validation rejects modified or extra
+Python source files before training; MLflow records `source=image-build`,
+`build_revision`, and those hashes. The revision is declared build metadata, not a
+cryptographic attestation that Git verified the image. Build only from reviewed,
+clean source and trusted CI; never manufacture a fake Git checkout.
+
+The Compose-only setting `PARKINSONS_HTTP_MLFLOW_HOSTS=mlflow:5000` allows exactly
+that HTTP authority. Arbitrary remote hosts, other ports, IP ranges and wildcard
+allowlists remain disallowed; the default outside Docker is still loopback-only
+HTTP. This relaxation is only for the private, single-host Compose network.
+Published ports bind to `127.0.0.1`; MLflow and the dashboard have no public-access
+authentication. External access requires a separately reviewed TLS/access-control setup.
+
+Bootstrap waits for MLflow with bounded retries, verifies/prepares the pinned data,
+and reconciles pending promotion intents under the shared promotion lock. It trains
+only when there is no champion and validates the immutable champion before finishing.
+An existing champion is preserved; startup does not automatically retrain or replace
+it. Existing prepared data is checksum/configuration validated and reused without
+re-reading `test.csv`. Corrupt, partial, or incompatible existing outputs fail startup
+rather than being silently discarded. Stop the stack and investigate before manually
+replacing persistent data or changing dataset/configuration identities.
+
+After bootstrap succeeds:
+- MLflow: <http://127.0.0.1:5000>
+- API docs: <http://127.0.0.1:8000/docs>
+- Dashboard: <http://127.0.0.1:8501>
+
+Use the API key exported above for requests. Bootstrap does not create prediction
+traffic; the dashboard initially has an empty inference window. Synthetic inputs
+remain confined to tests, including the isolated CI smoke test.
+
+### Persistence, shutdown, and verification
+
+Named volumes persist MLflow SQLite metadata/artifacts, raw/prepared application
+data, and the shared promotion lock separately. Only MLflow accesses its database
+volume; API/bootstrap coordinate through the lock volume, not SQLite internals.
+Use `docker compose down` without `--volumes` to preserve state. The configured
+30-second stop grace period is the supervisor's hard stop bound after termination;
+interrupted promotion remains subject to the existing durable reconciliation policy.
+
+For a consistent backup, stop the entire stack so neither predictions, dashboard
+reports, bootstrap nor training can write. Back up all named volumes together,
+including the database and artifact directory, plus the data bundle and source
+revision. Restart after copying; test restoration into an isolated Compose project.
+Do not copy a live SQLite database independently from its artifacts.
+
+CI builds the image, starts from empty volumes, verifies prediction/report persistence,
+reruns bootstrap, and checks restart preservation. A passing Python test suite alone
+does not establish that image builds or Compose startup work; verify the hosted
+container smoke job on a Docker-capable runner.
 
 ## MLflow tracking server
 

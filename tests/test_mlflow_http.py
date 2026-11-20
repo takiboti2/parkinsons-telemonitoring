@@ -26,7 +26,17 @@ from mlflow.tracking.fluent import ActiveModelContext
 from mlflow.utils.thread_utils import ThreadLocalVariable
 from sklearn.linear_model import LinearRegression
 
-from parkinsons_ml import api, experimentation, inference, monitoring, promotion, tracking, training
+from parkinsons_ml import (
+    api,
+    deployment,
+    experimentation,
+    inference,
+    monitoring,
+    promotion,
+    provenance,
+    tracking,
+    training,
+)
 from parkinsons_ml.schema import BASELINE_FEATURES, CANDIDATE_FEATURES
 from parkinsons_ml.training import FeaturePreparation, build_pipeline
 
@@ -664,6 +674,51 @@ def test_api_training_and_logged_immutable_inference_http(
         manifest, restored = monitoring.open_saved_report(client, window.cohort, saved_report)
         assert manifest["batches"] == window.manifest()["batches"]
         assert restored.summary == report.summary and restored.html is not None
+
+
+def test_git_free_bootstrap_preserves_champion_and_rejects_corruption_http(
+    image_root: Path,
+    tmp_path: Path,
+    http_tracking_state: None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bundle = tmp_path / "bundle"
+    deployment.create_bundle(image_root, bundle)
+    (image_root / "data/raw/parkinsons_updrs.csv").unlink()
+    provenance.write_provenance(image_root, "a" * 40)
+    monkeypatch.setattr(tracking, "ROOT", image_root)
+    monkeypatch.setattr(tracking, "__file__", str(image_root / "src/parkinsons_ml/tracking.py"))
+    lock = tmp_path / "bootstrap.lock"
+    monkeypatch.setattr(tracking, "PROMOTION_LOCK", lock)
+    monkeypatch.setattr(deployment, "PROMOTION_LOCK", lock)
+    with running_server(tmp_path / "server", free_port()) as uri:
+        deployment.bootstrap(image_root, bundle, uri)
+        client = mlflow.MlflowClient(tracking_uri=uri, registry_uri=uri)
+        model = client.get_registered_model("bootstrap-model")
+        champion = model.aliases["champion"]
+        source = client.get_model_version("bootstrap-model", champion)
+        assert source.run_id is not None
+        parent_id = client.get_run(source.run_id).data.tags["mlflow.parentRunId"]
+        lineage_path = client.download_artifacts(parent_id, "lineage.json", str(tmp_path))
+        assert json.loads(Path(lineage_path).read_bytes())["source"] == "image-build"
+        manifest = image_root / "data/processed/manifest.json"
+        original_mtime = manifest.stat().st_mtime_ns
+        count = len(client.search_runs([client.get_run(source.run_id).info.experiment_id]))
+        deployment.bootstrap(image_root, bundle, uri)
+        assert manifest.stat().st_mtime_ns == original_mtime
+        assert client.get_registered_model("bootstrap-model").aliases["champion"] == champion
+        assert len(client.search_runs([client.get_run(source.run_id).info.experiment_id])) == count
+        assert len(client.search_model_versions("name = 'bootstrap-model'")) == 1
+        client.set_registered_model_tag("bootstrap-model", promotion.PENDING, "unresolved-intent")
+        with pytest.raises(MlflowException):
+            deployment.bootstrap(image_root, bundle, uri)
+        assert client.get_registered_model("bootstrap-model").aliases["champion"] == champion
+        assert client.get_registered_model("bootstrap-model").tags[promotion.PENDING] == "unresolved-intent"
+        client.delete_registered_model_tag("bootstrap-model", promotion.PENDING)
+        (image_root / "data/processed/train.csv").write_text("corrupt")
+        with pytest.raises(ValueError, match="checksum"):
+            deployment.bootstrap(image_root, bundle, uri)
+        assert client.get_registered_model("bootstrap-model").aliases["champion"] == champion
 
 
 def test_monitoring_filters_time_status_cohort_and_pages_over_http(

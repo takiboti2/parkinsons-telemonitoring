@@ -1,0 +1,127 @@
+x-runtime: &runtime
+  image: parkinsons-telemonitoring:${SOURCE_REVISION:?Set SOURCE_REVISION to the clean commit SHA}
+  build:
+    context: .
+    args:
+      SOURCE_REVISION: ${SOURCE_REVISION}
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:mode=1777
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  networks:
+    - application
+  stop_grace_period: 30s
+
+x-client: &client
+  MLFLOW_TRACKING_URI: http://mlflow:5000
+  PARKINSONS_HTTP_MLFLOW_HOSTS: mlflow:5000
+  MLFLOW_HTTP_REQUEST_MAX_RETRIES: "0"
+  MLFLOW_HTTP_REQUEST_TIMEOUT: "10"
+  MLFLOW_DISABLE_TELEMETRY: "true"
+  MLFLOW_ENABLE_ARTIFACTS_PROGRESS_BAR: "false"
+
+services:
+  mlflow:
+    <<: *runtime
+    environment:
+      MLFLOW_DISABLE_TELEMETRY: "true"
+    command:
+      - mlflow
+      - server
+      - --host
+      - 0.0.0.0
+      - --port
+      - "5000"
+      - --workers
+      - "1"
+      - --allowed-hosts
+      - mlflow:5000,localhost:5000,127.0.0.1:5000
+      - --backend-store-uri
+      - sqlite:////var/lib/mlflow/mlflow.db
+      - --registry-store-uri
+      - sqlite:////var/lib/mlflow/mlflow.db
+      - --default-artifact-root
+      - mlflow-artifacts:/
+      - --serve-artifacts
+      - --artifacts-destination
+      - /var/lib/mlflow/artifacts
+    volumes:
+      - mlflow:/var/lib/mlflow
+    ports:
+      - 127.0.0.1:5000:5000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:5000/health', timeout=3)"]
+      interval: 5s
+      timeout: 5s
+      retries: 24
+      start_period: 20s
+
+  bootstrap:
+    <<: *runtime
+    environment: *client
+    depends_on:
+      mlflow:
+        condition: service_healthy
+    command: ["python", "-m", "parkinsons_ml.deployment", "bootstrap"]
+    volumes:
+      - app-data:/app/data
+      - promotion-lock:/app/storage/mlflow
+      - type: bind
+        source: ${DATA_BUNDLE_DIR:?Set DATA_BUNDLE_DIR to a checksum-verified bundle directory}
+        target: /bundle
+        read_only: true
+        bind:
+          create_host_path: false
+
+  api:
+    <<: *runtime
+    environment:
+      <<: *client
+      PARKINSONS_API_KEY: ${PARKINSONS_API_KEY:?Set a private API key of at least 32 characters}
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_healthy
+    command: ["uvicorn", "parkinsons_ml.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    volumes:
+      - app-data:/app/data:ro
+      - promotion-lock:/app/storage/mlflow
+    ports:
+      - 127.0.0.1:8000:8000
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health/ready', timeout=5)"]
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 10s
+
+  dashboard:
+    <<: *runtime
+    environment: *client
+    depends_on:
+      bootstrap:
+        condition: service_completed_successfully
+      mlflow:
+        condition: service_healthy
+    command: ["streamlit", "run", "src/parkinsons_ml/dashboard.py", "--server.address", "0.0.0.0", "--server.port", "8501", "--server.fileWatcherType", "none", "--browser.gatherUsageStats", "false"]
+    ports:
+      - 127.0.0.1:8501:8501
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8501/_stcore/health', timeout=3)"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+
+networks:
+  application:
+    internal: true
+
+volumes:
+  mlflow:
+  app-data:
+  promotion-lock:

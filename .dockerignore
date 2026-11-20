@@ -1,0 +1,17 @@
+**
+!Dockerfile
+!pyproject.toml
+!uv.lock
+!requirements.txt
+!README.md
+!params.yaml
+!dvc.yaml
+!dvc.lock
+!src/
+!src/parkinsons_ml/
+!src/parkinsons_ml/*.py
+!documents/
+!documents/data-bundle.json
+!data/
+!data/raw/
+!data/raw/parkinsons_updrs.csv.dvc
