@@ -398,6 +398,24 @@ nonfinite/unrepresentable numbers, invalid sex/age encodings, targets, subject I
 and unknown keys are rejected. Time is zero-clipped using the pipeline's policy.
 No measurements are silently dropped; predictions retain request order.
 
+To submit a range of existing **development** records instead of hand-writing JSON:
+
+```bash
+uv run --frozen python -m parkinsons_ml.predict_rows --start-row 1 --end-row 50
+uv run --frozen python -m parkinsons_ml.predict_rows --start-row 51 --end-row 100
+uv run --frozen python -m parkinsons_ml.predict_rows --start-row 101 --end-row 150
+```
+
+Row numbers are **1-based and inclusive**, excluding the CSV header. The command
+reads only `data/processed/train.csv`, never the held-out `test.csv`, and sends only
+canonical predictors to `http://127.0.0.1:8000/predict`. It reads the saved key from
+the root `.env` (environment takes precedence), prints the response, and does not
+retry failed requests. Invalid/out-of-range selections and batches over 1000 rows
+are rejected without submitting a partial batch. A lower server-configured limit
+still applies. Each successful call creates real MLflow inference artifacts; refresh
+the dashboard window to include them. These are development-data smoke requests,
+not evidence of production performance or an independent drift evaluation.
+
 The default limit is 1,000 records; `PARKINSONS_MAX_BATCH_SIZE` can lower it to any
 integer from 1 to 1,000. Actual POST body bytes, including chunked bodies, are capped
 at 1 MiB before JSON parsing. Authentication happens first, so unauthenticated
