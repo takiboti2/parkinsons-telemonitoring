@@ -39,10 +39,14 @@ def predict_rows(start_row: int, end_row: int) -> dict[str, object]:
     if count > 1000:
         raise RowSelectionError("Select at most 1000 rows per request")
     settings = ClientSettings.model_validate({})
+
+    def skip_row(row: object) -> bool:
+        return isinstance(row, int) and 0 < row < start_row
+
     frame = pd.read_csv(
         ROOT / "data/processed/train.csv",
         usecols=pd.Index(CANDIDATE_FEATURES),
-        skiprows=lambda row: isinstance(row, int) and 0 < row < start_row,
+        skiprows=skip_row,
         nrows=count,
         dtype=float,
     )
