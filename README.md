@@ -286,12 +286,41 @@ artifacts and writers must be trusted.
 
 ## FastAPI service
 
+### One-time API key setup
+
+Generate a random key once (the command prints a secret; do not screenshot its output):
+
+```bash
+uv run --frozen python -c 'import secrets; print(secrets.token_urlsafe(32))'
+```
+
+Add the result to the repository-root `.env` using your editor, preserving any
+existing entries:
+
+```dotenv
+PARKINSONS_API_KEY=<paste-the-generated-key-here>
+```
+
+```bash
+chmod 600 .env
+```
+
+`.env` is Git-ignored and excluded from Docker images. Reuse this key; do not
+regenerate it every time you start the service. There is no default key, and missing
+or shorter-than-32-character keys prevent API startup.
+
+Both Compose and locally launched FastAPI use this file. FastAPI looks specifically
+at the repository root, independent of the caller's working directory, and ignores
+Compose-only entries. Environment variables override file values; unset a previously
+exported `PARKINSONS_API_KEY` if you intend to use the file's value.
+
+### Start locally
+
 Start MLflow first in its own terminal. In another terminal, set the connection and
-a secret API key of at least 32 characters, then start **one worker**:
+start **one worker**; the key comes from `.env`:
 
 ```bash
 export MLFLOW_TRACKING_URI="http://127.0.0.1:5000"
-export PARKINSONS_API_KEY="$(uv run --frozen python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 export MLFLOW_HTTP_REQUEST_MAX_RETRIES=0
 export MLFLOW_HTTP_REQUEST_TIMEOUT=10
 uv run --frozen uvicorn parkinsons_ml.api:create_app --factory \
@@ -299,12 +328,14 @@ uv run --frozen uvicorn parkinsons_ml.api:create_app --factory \
 ```
 
 Keep that key private and reuse it for client requests. The service requires an
-explicit MLflow URI and API key; it does not load `.env`. Plain HTTP MLflow URIs
+explicit MLflow URI and API key. Dotenv loading configures the API's own settings;
+MLflow SDK options such as timeouts/retries must still be exported as above.
+Plain HTTP MLflow URIs
 are restricted to loopback by default, as with CLI training. Do not expose the API publicly
 without HTTPS and appropriate deployment controls. CORS is not enabled.
 
-Open <http://127.0.0.1:8000/docs> for Swagger schemas, a full-feature prediction
-example, and the **Authorize** control for the `X-API-Key` header.
+Open <http://127.0.0.1:8000/docs> for Swagger schemas and a full-feature prediction
+example. Paste the saved key once into **Authorize** for the `X-API-Key` header.
 
 | Endpoint | Authentication | Behavior |
 | --- | --- | --- |
@@ -321,7 +352,16 @@ and a missing champion leaves prediction/readiness unavailable while training re
 An unconfirmed promotion intent likewise blocks prediction and readiness until a later
 promotion reconciles it; the service never serves a transient alias.
 
-Run training with an empty JSON request:
+For curl examples, load the saved key into a shell variable once per client terminal
+(from the repository root). This uses the dotenv parser already installed with
+`pydantic-settings`; it does not execute the file as a shell script:
+
+```bash
+PARKINSONS_API_KEY="$(uv run --frozen python -c 'from dotenv import dotenv_values; print(dotenv_values(".env")["PARKINSONS_API_KEY"])')"
+```
+
+If you deliberately supplied an environment override to the server, use that key
+instead. Run training with an empty JSON request:
 
 ```bash
 curl --fail-with-body http://127.0.0.1:8000/train \
@@ -507,11 +547,15 @@ being packaged. These commands do not commit changes:
 test -z "$(git status --porcelain)" || { echo "Commit or preserve pending changes before building"; exit 1; }
 export SOURCE_REVISION="$(git rev-parse HEAD)"
 export DATA_BUNDLE_DIR="$(pwd)/data-bundle"
-export PARKINSONS_API_KEY="$(uv run --frozen python -c 'import secrets; print(secrets.token_urlsafe(32))')"
 docker compose config --quiet
 docker compose build bootstrap
 docker compose up --no-build --wait --wait-timeout 600
 ```
+
+Complete the [one-time API key setup](#one-time-api-key-setup) first. Compose reads
+the saved key from the root `.env` and passes it only to the API container; no key
+export is needed. Local API startup reads the same file, but the container receives
+the value through its environment, not through a mounted dotenv file.
 
 `--wait` recognizes bootstrap's `service_completed_successfully` dependencies: it
 requires a successful exit, not a running bootstrap process. A failed bootstrap
@@ -532,6 +576,16 @@ notebooks, credentials and host environments, and runs as a non-root user with a
 read-only root filesystem. API keys are supplied at runtime, never baked into an
 image. Keep environment files out of Git; Docker administrators can inspect container
 environment values.
+
+To rotate the key, replace only its entry in `.env`, then recreate the API container:
+
+```bash
+docker compose up -d --no-deps --force-recreate api
+```
+
+For a locally launched API, restart Uvicorn instead. Update Swagger/clients too;
+the old key stops working after restart. Remove any stale environment override
+before rotation. Key changes do not require rebuilding the image.
 
 Training retains checkout validation for local development. Images instead include
 `build-provenance.json`, generated from the actual packaged source, dependency,
@@ -569,7 +623,7 @@ After bootstrap succeeds:
 - API docs: <http://127.0.0.1:8000/docs>
 - Dashboard: <http://127.0.0.1:8501>
 
-Use the API key exported above for requests. Bootstrap does not create prediction
+Use the saved API key for requests. Bootstrap does not create prediction
 traffic; the dashboard initially has an empty inference window. Synthetic inputs
 remain confined to tests, including the isolated CI smoke test.
 
@@ -649,7 +703,8 @@ export MLFLOW_TRACKING_URI="http://127.0.0.1:5000"
 export MLFLOW_REGISTRY_URI="$MLFLOW_TRACKING_URI"
 ```
 
-These exports apply to that shell; `.env` is not automatically loaded. Training
+These exports apply to that shell; the training CLI and dashboard do not automatically
+load `.env` (unlike API settings and Compose). Training
 requires an explicit tracking URI and uses that same server for model loading;
 there is no untracked-training/local-store fallback.
 

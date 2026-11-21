@@ -9,9 +9,15 @@ import pandas as pd
 import pytest
 import yaml
 
-from parkinsons_ml import tracking
+from parkinsons_ml import api, tracking
 from parkinsons_ml.data import PrepareConfig, prepare
 from parkinsons_ml.schema import RAW_COLUMNS
+
+
+@pytest.fixture(autouse=True)
+def isolated_api_dotenv(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Never read a developer's root dotenv file during tests."""
+    monkeypatch.setitem(api.APISettings.model_config, "env_file", tmp_path / "api.env")
 
 
 @pytest.fixture
