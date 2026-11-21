@@ -4,6 +4,7 @@ import argparse
 import ipaddress
 import json
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Generator
@@ -39,16 +40,17 @@ from parkinsons_ml.experimentation import (
 )
 from parkinsons_ml.schema import POLICY_VERSION, SCHEMA_VERSION
 from parkinsons_ml.promotion import promote_winner
+from parkinsons_ml.provenance import image_lineage
 from parkinsons_ml.training import build_pipeline
 
-# Training is deliberately repository-only. Validate this source-layout assumption
-# before contacting MLflow rather than misidentifying a wheel's site-packages root.
+# Training requires the source layout, backed by Git or verified image provenance.
+# Validate it before contacting MLflow rather than accepting an arbitrary wheel.
 ROOT = Path(__file__).resolve().parents[2]
 PROMOTION_LOCK = ROOT / "storage/mlflow/promotion.lock"
 
 
 def validate_repository() -> None:
-    """Fail early and explicitly when repository-only experimentation is unavailable."""
+    """Require a source checkout or a hash-verified source-layout image."""
     if (
         Path(__file__).resolve().parent != ROOT / "src/parkinsons_ml"
         or not (ROOT / "uv.lock").is_file()
@@ -57,6 +59,9 @@ def validate_repository() -> None:
         raise ValueError(
             "Training requires a source checkout containing src/parkinsons_ml, uv.lock, and pyproject.toml"
         )
+    if not (ROOT / ".git").exists() and (ROOT / "build-provenance.json").exists():
+        image_lineage(ROOT)
+        return
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"], cwd=ROOT, check=True, capture_output=True, text=True
@@ -71,6 +76,8 @@ def validate_repository() -> None:
 
 def lineage() -> dict[str, object]:
     """Allowlisted hashes only; never upload working-tree contents or environment."""
+    if not (ROOT / ".git").exists() and (ROOT / "build-provenance.json").exists():
+        return image_lineage(ROOT)
 
     def git(*args: str) -> str:
         return subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True, text=True).stdout.strip()
@@ -231,7 +238,18 @@ def validate_tracking_uri(tracking_uri: str) -> None:
         except ValueError:
             loopback = False
         if not loopback:
-            raise ValueError("Remote MLflow servers require HTTPS; HTTP is allowed only for loopback hosts")
+            allowed = os.environ.get("PARKINSONS_HTTP_MLFLOW_HOSTS", "").split(",")
+            allowed = [authority.strip().lower() for authority in allowed if authority.strip()]
+            if any(
+                not re.fullmatch(r"[a-z][a-z0-9-]*:[0-9]{1,5}", authority)
+                or not 1 <= int(authority.rsplit(":", 1)[1]) <= 65535
+                for authority in allowed
+            ):
+                raise ValueError("HTTP allowlist requires exact container service:port authorities")
+            if parsed.netloc.lower() not in allowed:
+                raise ValueError(
+                    "Remote MLflow servers require HTTPS; HTTP requires loopback or an explicit container host"
+                )
 
 
 @contextmanager

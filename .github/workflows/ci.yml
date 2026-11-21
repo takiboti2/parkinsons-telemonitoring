@@ -56,3 +56,130 @@ jobs:
       # servers. No DVC remote, development service, or project secrets are needed.
       - name: Run tests and coverage
         run: uv run --frozen pytest
+
+  compose:
+    name: Container smoke test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    env:
+      COMPOSE_PROJECT_NAME: parkinsons-ci
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Restore checksum-keyed raw data
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: data-bundle/parkinsons_updrs.csv
+          key: parkinsons-raw-${{ hashFiles('documents/data-bundle.json') }}
+      - name: Validate Compose without deployment credentials
+        run: env -u SOURCE_REVISION -u DATA_BUNDLE_DIR -u PARKINSONS_API_KEY docker compose config --quiet
+      - name: Obtain and verify the pinned offline bundle
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, io, json, pathlib, urllib.request, zipfile
+          pin = json.loads(pathlib.Path("documents/data-bundle.json").read_text())
+          destination = pathlib.Path("data-bundle")
+          destination.mkdir(exist_ok=True)
+          raw = destination / pin["filename"]
+          if raw.exists():
+              data = raw.read_bytes()
+          else:
+              with urllib.request.urlopen(pin["download_url"], timeout=60) as response:
+                  archive = response.read(5 * 1024 * 1024)
+              with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+                  member = bundle.getinfo(pin["archive_member"])
+                  assert member.file_size == pin["size"]
+                  data = bundle.read(member)
+          assert len(data) == pin["size"]
+          assert hashlib.sha256(data).hexdigest() == pin["sha256"]
+          raw.write_bytes(data)
+          (destination / "manifest.json").write_text(json.dumps(pin))
+          PY
+          echo "SOURCE_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+          echo "DATA_BUNDLE_DIR=$GITHUB_WORKSPACE/data-bundle" >> "$GITHUB_ENV"
+          key="$(python3 -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          echo "::add-mask::$key"
+          echo "PARKINSONS_API_KEY=$key" >> "$GITHUB_ENV"
+      - name: Build and bootstrap from empty volumes
+        run: |
+          test -z "$(git status --porcelain)"
+          docker compose config --quiet
+          docker compose build bootstrap
+      - name: Anchor image provenance to the committed source
+        run: |
+          docker compose run --rm --no-deps --entrypoint cat bootstrap /app/build-provenance.json > /tmp/provenance.json
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          with open("/tmp/provenance.json") as source:
+              manifest = json.load(source)
+          revision = os.environ["SOURCE_REVISION"]
+          assert manifest["build_revision"] == revision
+          for path, checksum in manifest["sha256"].items():
+              committed_path = "data/raw/parkinsons_updrs.csv.dvc" if path == "dataset.dvc" else path
+              data = subprocess.check_output(["git", "show", f"{revision}:{committed_path}"])
+              assert hashlib.sha256(data).hexdigest() == checksum, path
+          PY
+      - name: Start with one-shot bootstrap dependencies
+        run: |
+          docker compose up --no-build --wait --wait-timeout 600
+      - name: Verify serving and monitoring
+        run: |
+          docker compose exec -T api python - <<'PY'
+          import json, os, urllib.request
+          from mlflow.tracking import MlflowClient
+          from parkinsons_ml.monitoring import WindowConfig, load_window, build_report, save_report, open_saved_report
+          from parkinsons_ml.provenance import image_lineage
+          from parkinsons_ml.tracking import ROOT
+          image_lineage(ROOT)
+          values = {
+              "age": 65, "sex": 0, "test_time": 10,
+              "jitter": .004, "jitter_abs": .00003, "jitter_rap": .002,
+              "jitter_ppq5": .002, "jitter_ddp": .006, "shimmer": .03,
+              "shimmer_db": .3, "shimmer_apq3": .02, "shimmer_apq5": .02,
+              "shimmer_apq11": .025, "shimmer_dda": .06, "nhr": .02,
+              "hnr": 20, "rpde": .5, "dfa": .65, "ppe": .2,
+          }
+          request = urllib.request.Request(
+              "http://127.0.0.1:8000/predict",
+              data=json.dumps({"records": [values] * 50}).encode(),
+              headers={"Content-Type": "application/json", "X-API-Key": os.environ["PARKINSONS_API_KEY"]},
+          )
+          with urllib.request.urlopen(request, timeout=60) as response:
+              result = json.load(response)
+          client = MlflowClient()
+          assert client.get_run(result["run_id"]).info.status == "FINISHED"
+          window = load_window(client, "motor-updrs", result["model_version"], WindowConfig())
+          report = build_report(window)
+          assert report.html is not None
+          report_id = save_report(client, window, report)
+          open_saved_report(client, window.cohort, report_id)
+          with open("/app/storage/mlflow/smoke.json", "w") as output:
+              json.dump({"version": result["model_version"], "report": report_id}, output)
+          PY
+      - name: Verify bootstrap idempotence and restart persistence
+        run: |
+          docker compose stop api dashboard
+          docker compose restart mlflow
+          docker compose up --no-build -d --wait --wait-timeout 180 mlflow
+          docker compose up --no-build --no-deps --force-recreate --exit-code-from bootstrap bootstrap
+          docker compose up --no-build --wait --wait-timeout 180
+          docker compose exec -T api python - <<'PY'
+          import json
+          from mlflow.tracking import MlflowClient
+          from parkinsons_ml.monitoring import load_cohort, open_saved_report
+          with open("/app/storage/mlflow/smoke.json") as source:
+              saved = json.load(source)
+          client = MlflowClient()
+          assert client.get_registered_model("motor-updrs").aliases["champion"] == saved["version"]
+          cohort = load_cohort(client, "motor-updrs", saved["version"])
+          open_saved_report(client, cohort, saved["report"])
+          PY
+      - name: Container diagnostics
+        if: failure()
+        run: docker compose logs --no-color
+      - name: Remove test containers and volumes
+        if: always()
+        run: docker compose down --volumes --remove-orphans

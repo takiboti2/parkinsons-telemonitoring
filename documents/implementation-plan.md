@@ -2,8 +2,8 @@
 
 ## 1. Establish the application foundation
 
-- The installable `src/parkinsons_ml/` package, preprocessing, experimentation, and
-  tracking modules exist. Add API and monitoring modules as those services are implemented.
+- The installable `src/parkinsons_ml/` package includes data, training, API,
+  monitoring/dashboard, build provenance and bootstrap modules.
 - Typed API settings cover MLflow, API authentication, and batch limits; data/parameter
   paths remain server-owned. Add monitoring configuration only as needed.
 - The initial GitHub Actions workflow covers hooks, tests, coverage, lock/export
@@ -41,8 +41,8 @@ pipeline construction. See README for the module boundaries, CLI, and policy.
 
 - Reuse this function from deployment bootstrap without invoking the CLI; `/train`
   already uses it directly.
-- Define explicit build provenance before supporting training from installed wheels
-  or deployment images without their own Git source checkout.
+- Git-free source-layout images now validate build provenance. Installed wheels
+  without the approved layout/provenance remain unsupported.
 - Implement a separate final-test assessment operation; keep test data out of
   experimentation, tuning, and promotion decisions.
 - Capture genuine development-system run evidence when running real-data experiments;
@@ -85,15 +85,15 @@ Synthetic data is confined to tests; no demonstration generator or traffic is ad
 
 ## 8. Make deployment reproducible with Compose
 
-- Use three long-running services: MLflow, FastAPI, and Streamlit. Add a small one-shot
-  bootstrap task using the shared training function to create a champion only if absent.
-- Pin Docker images, persist MLflow metadata/artifacts, configure health checks and
-  bounded startup retries, and bind published ports to localhost. Keep secrets out of images.
-- Make `docker compose up` obtain pinned data and start the full system without manual
-  service setup. Supply an accessible data source or documented offline bundle for a
-  machine without the local DVC remote; do not assume an existing cache.
-- Verify clean startup, MLflow HTTP artifact access, train/predict behavior, and restart
-  persistence. Document manual consistent SQLite/artifact/remote backups; no backup service.
+Pinned shared images, three services, one-shot bootstrap, verified offline bundle
+delivery, hash-bound image provenance, scoped Compose HTTP routing, persistent volumes,
+health dependencies and a container smoke CI job are implemented. See README for
+setup, trust boundaries and consistent manual backups. Remaining:
+
+- Verify image builds, empty-volume startup and restart preservation on a Docker-capable
+  runner. Docker was unavailable in the implementation WSL environment; Python/HTTP
+  tests are not substitutes for a passing container smoke job.
+- Capture genuine running-system evidence after the deployed services have been verified.
 
 ## 9. Verify and document the operational system
 
