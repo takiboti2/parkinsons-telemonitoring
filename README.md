@@ -602,7 +602,10 @@ even if a stale, Git-ignored `build-provenance.json` is present.
 The Compose-only setting `PARKINSONS_HTTP_MLFLOW_HOSTS=mlflow:5000` allows exactly
 that HTTP authority. Arbitrary remote hosts, other ports, IP ranges and wildcard
 allowlists remain disallowed; the default outside Docker is still loopback-only
-HTTP. This relaxation is only for the private, single-host Compose network.
+HTTP. This relaxation is only for the single-host Compose network.
+The application uses a normal bridge network, not an `internal: true` network, so
+Docker Desktop can publish the service ports to the host. Containers can make
+outbound connections; this network is not an egress-isolation boundary.
 Published ports bind to `127.0.0.1`; MLflow and the dashboard have no public-access
 authentication. External access requires a separately reviewed TLS/access-control setup.
 
@@ -622,6 +625,22 @@ After bootstrap succeeds:
 - MLflow: <http://127.0.0.1:5000>
 - API docs: <http://127.0.0.1:8000/docs>
 - Dashboard: <http://127.0.0.1:8501>
+
+If upgrading from the internal-network configuration, recreate the network and
+containers using the existing image and the same `SOURCE_REVISION`/bundle settings:
+
+```bash
+docker compose down
+docker compose up -d --no-build --wait --wait-timeout 600
+docker compose ps
+curl --fail --connect-timeout 5 http://127.0.0.1:8000/health/live
+```
+
+Do **not** add `--volumes`: named volumes retain datasets, MLflow metadata/artifacts,
+and promotion state. `restart` or container recreation alone does not replace the
+existing network. A healthy container is not proof of host access: `docker compose ps`
+must show mappings such as `127.0.0.1:8000->8000/tcp`, not just `8000/tcp`.
+Subsequent image builds package the updated Compose configuration into provenance.
 
 Use the saved API key for requests. Bootstrap does not create prediction
 traffic; the dashboard initially has an empty inference window. Synthetic inputs
@@ -649,7 +668,8 @@ Do not copy a live SQLite database independently from its artifacts.
 
 CI caches the raw payload keyed by the Git pin and revalidates its size/SHA-256 on
 every use. A cache miss still requires UCI availability; there is no fallback to
-different data. CI builds the image, starts from empty volumes, verifies prediction/report persistence,
+different data. CI builds the image, starts from empty volumes, checks the published
+MLflow/API/dashboard endpoints from the host, verifies prediction/report persistence,
 reruns bootstrap, and checks restart preservation. A passing Python test suite alone
 does not establish that image builds or Compose startup work; verify the hosted
 container smoke job on a Docker-capable runner.

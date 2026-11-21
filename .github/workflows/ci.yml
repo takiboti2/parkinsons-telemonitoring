@@ -125,6 +125,11 @@ jobs:
       - name: Start with one-shot bootstrap dependencies
         run: |
           docker compose up --no-build --wait --wait-timeout 600
+      - name: Verify published ports from the host
+        run: |
+          curl --fail --silent --show-error --output /dev/null --connect-timeout 5 --max-time 10 --retry 5 --retry-connrefused --retry-delay 2 http://127.0.0.1:5000/health
+          curl --fail --silent --show-error --output /dev/null --connect-timeout 5 --max-time 10 --retry 5 --retry-connrefused --retry-delay 2 http://127.0.0.1:8000/health/ready
+          curl --fail --silent --show-error --output /dev/null --connect-timeout 5 --max-time 10 --retry 5 --retry-connrefused --retry-delay 2 http://127.0.0.1:8501/_stcore/health
       - name: Verify serving and monitoring
         run: |
           docker compose exec -T api python - <<'PY'
