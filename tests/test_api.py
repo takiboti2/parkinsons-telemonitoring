@@ -49,6 +49,65 @@ def test_required_environment_settings(tmp_path: Path, monkeypatch: pytest.Monke
         api.create_app(settings)
 
 
+def test_dotenv_settings_authenticate_and_environment_overrides(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for name in ("PARKINSONS_API_KEY", "MLFLOW_TRACKING_URI", "PARKINSONS_MAX_BATCH_SIZE"):
+        monkeypatch.delenv(name, raising=False)
+    dotenv = tmp_path / "api.env"
+    dotenv.write_text(
+        f"PARKINSONS_API_KEY={KEY}\n"
+        "MLFLOW_TRACKING_URI=http://localhost:5000\n"
+        "SOURCE_REVISION=compose-only\n"
+        "DATA_BUNDLE_DIR=./data-bundle\n"
+    )
+    # The configured file is absolute; a dotenv in the caller's directory is ignored.
+    caller = tmp_path / "caller"
+    caller.mkdir()
+    (caller / ".env").write_text("PARKINSONS_API_KEY=short\n")
+    monkeypatch.chdir(caller)
+    settings = api.APISettings.model_validate({})
+    assert settings.api_key.get_secret_value() == KEY
+    assert KEY not in repr(settings)
+    assert settings.tracking_uri == "http://localhost:5000"
+    params = tmp_path / "params.yaml"
+    params.write_text("train:\n  experiment_name: dotenv-test\n")
+    monkeypatch.setattr(api, "PARAMS_PATH", params)
+    with TestClient(api.create_app()) as client:
+        # An authenticated invalid body reaches schema validation, not the registry.
+        assert client.post("/predict", json={}, headers=AUTH).status_code == 422
+        assert client.post("/predict", json={}).status_code == 401
+    override = "environment-override-key-not-a-real-secret"
+    monkeypatch.setenv("PARKINSONS_API_KEY", override)
+    monkeypatch.setenv("MLFLOW_TRACKING_URI", "http://localhost:5001")
+    settings = api.APISettings.model_validate({})
+    assert settings.api_key.get_secret_value() == override
+    assert settings.tracking_uri == "http://localhost:5001"
+    with TestClient(api.create_app()) as client:
+        assert client.post("/predict", json={}, headers=AUTH).status_code == 401
+        assert client.post("/predict", json={}, headers={"X-API-Key": override}).status_code == 422
+    assert dotenv.read_text().startswith(f"PARKINSONS_API_KEY={KEY}\n")
+
+
+@pytest.mark.parametrize("key", [None, "", "short"])
+def test_dotenv_does_not_allow_missing_or_weak_keys(
+    key: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("PARKINSONS_API_KEY", raising=False)
+    monkeypatch.delenv("MLFLOW_TRACKING_URI", raising=False)
+    content = "MLFLOW_TRACKING_URI=http://localhost:5000\n"
+    if key is not None:
+        content += f"PARKINSONS_API_KEY={key}\n"
+    (tmp_path / "api.env").write_text(content)
+    with pytest.raises(ValidationError) as caught:
+        api.APISettings.model_validate({})
+    assert "input_value" not in str(caught.value)
+    assert "PARKINSONS_API_KEY" in str(caught.value)
+
+
 @pytest.mark.parametrize(
     "uri,key",
     [

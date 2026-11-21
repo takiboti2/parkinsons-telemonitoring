@@ -39,9 +39,17 @@ READINESS_TIMEOUT = 3.0
 
 
 class APISettings(BaseSettings):
-    """Only environment/server-owned settings; dotenv files are not loaded."""
+    """Server-owned settings; environment variables override the root dotenv file."""
 
-    model_config = SettingsConfigDict(populate_by_name=True, frozen=True, hide_input_in_errors=True)
+    model_config = SettingsConfigDict(
+        populate_by_name=True,
+        frozen=True,
+        hide_input_in_errors=True,
+        env_file=ROOT / ".env",
+        env_file_encoding="utf-8",
+        # The shared file may also contain Compose-only variables.
+        extra="ignore",
+    )
     tracking_uri: str = Field(validation_alias="MLFLOW_TRACKING_URI", repr=False)
     api_key: SecretStr = Field(validation_alias="PARKINSONS_API_KEY", min_length=32)
     max_batch_size: int = Field(default=1000, validation_alias="PARKINSONS_MAX_BATCH_SIZE", ge=1, le=1000)
