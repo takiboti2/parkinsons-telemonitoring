@@ -33,6 +33,7 @@ def test_verified_bundle_roundtrip_preserves_existing_data(image_root: Path, tmp
 def test_bundle_rejection(image_root: Path, tmp_path: Path, problem: str) -> None:
     bundle = tmp_path / "bundle"
     deployment.create_bundle(image_root, bundle)
+    (image_root / "data/raw/parkinsons_updrs.csv").unlink()
     raw = bundle / "parkinsons_updrs.csv"
     if problem == "data":
         payload = bytearray(raw.read_bytes())
@@ -44,7 +45,7 @@ def test_bundle_rejection(image_root: Path, tmp_path: Path, problem: str) -> Non
         (bundle / "unexpected.csv").write_text("unexpected")
     elif problem == "link":
         raw.unlink()
-        raw.symlink_to(image_root / "data/raw/parkinsons_updrs.csv")
+        raw.symlink_to(image_root / "dataset.dvc")
     elif problem == "size":
         raw.write_text("short")
     else:
@@ -53,13 +54,37 @@ def test_bundle_rejection(image_root: Path, tmp_path: Path, problem: str) -> Non
         deployment.install_bundle(image_root, bundle)
 
 
-@pytest.mark.parametrize("problem", ["none", "revision", "file", "extra_source", "manifest"])
+@pytest.mark.parametrize(
+    "problem",
+    [
+        "none",
+        "revision",
+        "file",
+        "extra_source",
+        "manifest",
+        "nested_source",
+        "nested_changed",
+        "deployment",
+    ],
+)
 def test_image_provenance_binds_files(image_root: Path, problem: str) -> None:
     if problem == "revision":
         with pytest.raises(ValueError):
             provenance.write_provenance(image_root, "not-a-revision")
         return
     provenance.write_provenance(image_root, "a" * 40)
+    if problem == "nested_changed":
+        nested = image_root / "src/parkinsons_ml/package"
+        nested.mkdir()
+        (nested / "__init__.py").write_text("original")
+        provenance.write_provenance(image_root, "a" * 40)
+        (nested / "__init__.py").write_text("changed")
+    elif problem == "nested_source":
+        nested = image_root / "src/parkinsons_ml/package"
+        nested.mkdir()
+        (nested / "__init__.py").write_text("extra")
+    elif problem == "deployment":
+        (image_root / "compose.yaml").write_text("changed runtime")
     if problem == "file":
         (image_root / "params.yaml").write_text("changed")
     elif problem == "extra_source":
@@ -84,6 +109,60 @@ def test_tracking_accepts_verified_image_without_git(image_root: Path, monkeypat
     (image_root / "uv.lock").write_text("tampered")
     with pytest.raises(ValueError, match="provenance"):
         tracking.validate_repository()
+
+
+@pytest.mark.parametrize("bundle_state", ["missing", "empty", "modified"])
+def test_verified_persistent_raw_does_not_require_bundle(
+    image_root: Path,
+    tmp_path: Path,
+    bundle_state: str,
+) -> None:
+    bundle = tmp_path / "delivery"
+    if bundle_state != "missing":
+        bundle.mkdir()
+        if bundle_state == "modified":
+            (bundle / "manifest.json").write_text("invalid")
+    raw = image_root / "data/raw/parkinsons_updrs.csv"
+    before = raw.read_bytes(), raw.stat().st_mtime_ns
+    deployment.install_bundle(image_root, bundle)
+    assert (raw.read_bytes(), raw.stat().st_mtime_ns) == before
+    raw.write_text("corrupt persistent state")
+    with pytest.raises(ValueError, match="size"):
+        deployment.install_bundle(image_root, bundle)
+
+
+def test_checkout_ignores_stale_image_manifest(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Real checkouts (including worktrees with a .git file) keep Git validation
+    # and lineage even if someone has generated an obsolete image manifest.
+    monkeypatch.setattr(tracking, "image_lineage", MagicMock(side_effect=AssertionError("Must use Git")))
+    original_exists = Path.exists
+
+    def exists(path: Path) -> bool:
+        return path == tracking.ROOT / "build-provenance.json" or original_exists(path)
+
+    monkeypatch.setattr(Path, "exists", exists)
+    tracking.validate_repository()
+    assert "git_revision" in tracking.lineage()
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        ValueError("https://user:secret@example.org/private"),
+        RuntimeError("private path and credentials"),
+    ],
+)
+def test_cli_does_not_echo_external_exception_messages(
+    error: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["deployment", "bundle"])
+    monkeypatch.setattr(deployment, "create_bundle", MagicMock(side_effect=error))
+    with pytest.raises(SystemExit):
+        deployment.main()
+    assert type(error).__name__ in caplog.text
+    assert str(error) not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -139,7 +218,7 @@ def test_bundle_cli_and_sanitized_failure(
     assert (destination / "manifest.json").is_file()
     with pytest.raises(SystemExit):
         deployment.main()
-    assert "FileExistsError" in caplog.text and str(destination) not in caplog.text
+    assert "Bundle destination already exists" in caplog.text and str(destination) not in caplog.text
 
 
 def test_provenance_cli(image_root: Path, monkeypatch: pytest.MonkeyPatch) -> None:

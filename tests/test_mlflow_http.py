@@ -709,6 +709,14 @@ def test_git_free_bootstrap_preserves_champion_and_rejects_corruption_http(
         assert client.get_registered_model("bootstrap-model").aliases["champion"] == champion
         assert len(client.search_runs([client.get_run(source.run_id).info.experiment_id])) == count
         assert len(client.search_model_versions("name = 'bootstrap-model'")) == 1
+        for identity in ("dataset_id", "split_id"):
+            original = client.get_model_version("bootstrap-model", champion).tags[identity]
+            client.set_model_version_tag("bootstrap-model", champion, identity, "different")
+            with pytest.raises(ValueError, match="identity differs"):
+                deployment.bootstrap(image_root, bundle, uri)
+            assert client.get_registered_model("bootstrap-model").aliases["champion"] == champion
+            assert len(client.search_model_versions("name = 'bootstrap-model'")) == 1
+            client.set_model_version_tag("bootstrap-model", champion, identity, original)
         client.set_registered_model_tag("bootstrap-model", promotion.PENDING, "unresolved-intent")
         with pytest.raises(MlflowException):
             deployment.bootstrap(image_root, bundle, uri)

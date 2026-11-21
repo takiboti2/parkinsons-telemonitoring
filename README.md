@@ -468,7 +468,7 @@ fixtures exist **only in tests**, never as demonstration traffic.
 
 ## Docker Compose deployment
 
-Requires Docker Engine with Compose v2 (including `--wait` support). Stop any local
+Requires Docker Engine with Compose v2.24 or newer. Stop any local
 services already using ports 5000, 8000, and 8501. The stack uses three long-running
 services (MLflow, one-worker FastAPI, Streamlit) and a one-shot bootstrap task.
 No Airflow, external database, object store, or scheduler is added.
@@ -484,15 +484,19 @@ uv run --frozen python -m parkinsons_ml.deployment bundle --directory ./data-bun
 Alternatively, obtain this same directory from a trusted operator. It contains only
 `parkinsons_updrs.csv` and `manifest.json`. The Git-tracked
 `documents/data-bundle.json` pins the filename, size, SHA-256, dataset source, and
-DVC MD5. Bootstrap verifies both that pin and the DVC metadata, not merely the
-manifest supplied alongside the data. It refuses modified files, symlinked payloads,
-unexpected bundle contents, and an existing different raw dataset.
+DVC MD5, plus the archive download URL and member name. On initial installation,
+bootstrap verifies both that pin and the DVC metadata, not merely the supplied
+manifest. It refuses modified files, symlinked payloads, unexpected bundle contents,
+and an existing different raw dataset.
 
 The bundle is read-only delivery, not another dataset versioning system. Bootstrap
 copies verified raw bytes into persistent application data and runs existing
 preparation code. No access to the host-local DVC remote is required inside Docker.
 There is no unpinned download fallback. Do not mount an archive: supply the directory.
 The files must be readable by container UID 10001.
+On subsequent bootstraps, verified persistent raw data is reused without opening the
+delivery bundle. The Compose bind-source directory must still exist (it may be empty);
+an invalid persistent raw file always fails rather than being replaced from a bundle.
 
 ### Build and start
 
@@ -504,9 +508,23 @@ test -z "$(git status --porcelain)" || { echo "Commit or preserve pending change
 export SOURCE_REVISION="$(git rev-parse HEAD)"
 export DATA_BUNDLE_DIR="$(pwd)/data-bundle"
 export PARKINSONS_API_KEY="$(uv run --frozen python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+docker compose config --quiet
 docker compose build bootstrap
 docker compose up --no-build --wait --wait-timeout 600
 ```
+
+`--wait` recognizes bootstrap's `service_completed_successfully` dependencies: it
+requires a successful exit, not a running bootstrap process. A failed bootstrap
+blocks API/dashboard startup. Do not replace it with `compose run` and expect that
+one-off container to satisfy the dependency on the regular bootstrap service.
+
+Inspection and cleanup (`docker compose ps`, `logs`, `down`) do not require exported
+credentials or build variables. The default image tag is `local` and the default
+bundle path is `./data-bundle`; these are convenience defaults, not production build
+identities. Building without a full `SOURCE_REVISION` fails provenance generation,
+and starting the API without a valid key fails settings validation (no default key).
+If the stack used a nondefault image tag, export that revision again for commands
+that create or recreate containers.
 
 The Python 3.13 and uv base images are pinned by version and digest. The shared image
 uses `uv sync --frozen --no-dev`, excludes Git history, raw data, local storage,
@@ -517,11 +535,15 @@ environment values.
 
 Training retains checkout validation for local development. Images instead include
 `build-provenance.json`, generated from the actual packaged source, dependency,
-configuration and dataset-metadata hashes. Validation rejects modified or extra
-Python source files before training; MLflow records `source=image-build`,
+configuration and dataset-metadata hashes, including Docker/Compose configuration.
+Validation recursively checks Python source, including extra subpackage files,
+before training; MLflow records `source=image-build`,
 `build_revision`, and those hashes. The revision is declared build metadata, not a
 cryptographic attestation that Git verified the image. Build only from reviewed,
-clean source and trusted CI; never manufacture a fake Git checkout.
+clean source and trusted CI; never manufacture a fake Git checkout. CI requires a
+clean checkout and compares every packaged manifest hash against the declared Git
+commit before startup. Local checkouts (including Git worktrees) prefer Git lineage
+even if a stale, Git-ignored `build-provenance.json` is present.
 
 The Compose-only setting `PARKINSONS_HTTP_MLFLOW_HOSTS=mlflow:5000` allows exactly
 that HTTP authority. Arbitrary remote hosts, other ports, IP ranges and wildcard
@@ -532,12 +554,15 @@ authentication. External access requires a separately reviewed TLS/access-contro
 
 Bootstrap waits for MLflow with bounded retries, verifies/prepares the pinned data,
 and reconciles pending promotion intents under the shared promotion lock. It trains
-only when there is no champion and validates the immutable champion before finishing.
+only when there is no champion and validates the immutable champion before finishing,
+including matching its dataset/split identities to the prepared development snapshot.
 An existing champion is preserved; startup does not automatically retrain or replace
 it. Existing prepared data is checksum/configuration validated and reused without
 re-reading `test.csv`. Corrupt, partial, or incompatible existing outputs fail startup
 rather than being silently discarded. Stop the stack and investigate before manually
 replacing persistent data or changing dataset/configuration identities.
+Bootstrap logs the current startup phase and fixed operator-safe error messages;
+arbitrary exception text, filesystem paths and SDK credentials are not echoed.
 
 After bootstrap succeeds:
 - MLflow: <http://127.0.0.1:5000>
@@ -556,6 +581,11 @@ volume; API/bootstrap coordinate through the lock volume, not SQLite internals.
 Use `docker compose down` without `--volumes` to preserve state. The configured
 30-second stop grace period is the supervisor's hard stop bound after termination;
 interrupted promotion remains subject to the existing durable reconciliation policy.
+Long-running services use `restart: unless-stopped`; bootstrap does not automatically
+restart. Docker restart policies restart exited processes, not merely unhealthy ones,
+and do not reapply Compose startup dependencies after a daemon restart. Prediction
+still fails closed for pending promotions; rerun bootstrap to reconcile an interrupted
+promotion before expecting readiness.
 
 For a consistent backup, stop the entire stack so neither predictions, dashboard
 reports, bootstrap nor training can write. Back up all named volumes together,
@@ -563,7 +593,9 @@ including the database and artifact directory, plus the data bundle and source
 revision. Restart after copying; test restoration into an isolated Compose project.
 Do not copy a live SQLite database independently from its artifacts.
 
-CI builds the image, starts from empty volumes, verifies prediction/report persistence,
+CI caches the raw payload keyed by the Git pin and revalidates its size/SHA-256 on
+every use. A cache miss still requires UCI availability; there is no fallback to
+different data. CI builds the image, starts from empty volumes, verifies prediction/report persistence,
 reruns bootstrap, and checks restart preservation. A passing Python test suite alone
 does not establish that image builds or Compose startup work; verify the hosted
 container smoke job on a Docker-capable runner.

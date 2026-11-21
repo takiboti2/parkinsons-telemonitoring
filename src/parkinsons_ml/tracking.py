@@ -59,7 +59,7 @@ def validate_repository() -> None:
         raise ValueError(
             "Training requires a source checkout containing src/parkinsons_ml, uv.lock, and pyproject.toml"
         )
-    if (ROOT / "build-provenance.json").exists():
+    if not (ROOT / ".git").exists() and (ROOT / "build-provenance.json").exists():
         image_lineage(ROOT)
         return
     try:
@@ -76,7 +76,7 @@ def validate_repository() -> None:
 
 def lineage() -> dict[str, object]:
     """Allowlisted hashes only; never upload working-tree contents or environment."""
-    if (ROOT / "build-provenance.json").exists():
+    if not (ROOT / ".git").exists() and (ROOT / "build-provenance.json").exists():
         return image_lineage(ROOT)
 
     def git(*args: str) -> str:

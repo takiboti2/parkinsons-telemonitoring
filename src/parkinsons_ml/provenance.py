@@ -19,9 +19,12 @@ def source_hashes(root: Path) -> dict[str, str]:
             "dvc.lock",
             "documents/data-bundle.json",
             "dataset.dvc",
+            "Dockerfile",
+            ".dockerignore",
+            "compose.yaml",
         )
     ]
-    paths.extend(sorted((root / "src/parkinsons_ml").glob("*.py")))
+    paths.extend(sorted((root / "src/parkinsons_ml").rglob("*.py")))
     if not (root / "src/parkinsons_ml/tracking.py").is_file():
         raise ValueError("Image source layout is incomplete")
     return {str(path.relative_to(root)): hashlib.sha256(path.read_bytes()).hexdigest() for path in paths}

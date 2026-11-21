@@ -68,23 +68,34 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Obtain the pinned offline bundle
+      - name: Restore checksum-keyed raw data
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: data-bundle/parkinsons_updrs.csv
+          key: parkinsons-raw-${{ hashFiles('documents/data-bundle.json') }}
+      - name: Validate Compose without deployment credentials
+        run: env -u SOURCE_REVISION -u DATA_BUNDLE_DIR -u PARKINSONS_API_KEY docker compose config --quiet
+      - name: Obtain and verify the pinned offline bundle
         shell: bash
         run: |
           python3 - <<'PY'
           import hashlib, io, json, pathlib, urllib.request, zipfile
           pin = json.loads(pathlib.Path("documents/data-bundle.json").read_text())
-          url = "https://archive.ics.uci.edu/static/public/189/parkinsons+telemonitoring.zip"
-          with urllib.request.urlopen(url, timeout=60) as response:
-              archive = response.read(5 * 1024 * 1024)
-          with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
-              member = bundle.getinfo("parkinsons_updrs.data")
-              assert member.file_size == pin["size"]
-              data = bundle.read(member)
-          assert hashlib.sha256(data).hexdigest() == pin["sha256"]
           destination = pathlib.Path("data-bundle")
-          destination.mkdir()
-          (destination / pin["filename"]).write_bytes(data)
+          destination.mkdir(exist_ok=True)
+          raw = destination / pin["filename"]
+          if raw.exists():
+              data = raw.read_bytes()
+          else:
+              with urllib.request.urlopen(pin["download_url"], timeout=60) as response:
+                  archive = response.read(5 * 1024 * 1024)
+              with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+                  member = bundle.getinfo(pin["archive_member"])
+                  assert member.file_size == pin["size"]
+                  data = bundle.read(member)
+          assert len(data) == pin["size"]
+          assert hashlib.sha256(data).hexdigest() == pin["sha256"]
+          raw.write_bytes(data)
           (destination / "manifest.json").write_text(json.dumps(pin))
           PY
           echo "SOURCE_REVISION=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
@@ -94,7 +105,25 @@ jobs:
           echo "PARKINSONS_API_KEY=$key" >> "$GITHUB_ENV"
       - name: Build and bootstrap from empty volumes
         run: |
+          test -z "$(git status --porcelain)"
+          docker compose config --quiet
           docker compose build bootstrap
+      - name: Anchor image provenance to the committed source
+        run: |
+          docker compose run --rm --no-deps --entrypoint cat bootstrap /app/build-provenance.json > /tmp/provenance.json
+          python3 - <<'PY'
+          import hashlib, json, os, subprocess
+          with open("/tmp/provenance.json") as source:
+              manifest = json.load(source)
+          revision = os.environ["SOURCE_REVISION"]
+          assert manifest["build_revision"] == revision
+          for path, checksum in manifest["sha256"].items():
+              committed_path = "data/raw/parkinsons_updrs.csv.dvc" if path == "dataset.dvc" else path
+              data = subprocess.check_output(["git", "show", f"{revision}:{committed_path}"])
+              assert hashlib.sha256(data).hexdigest() == checksum, path
+          PY
+      - name: Start with one-shot bootstrap dependencies
+        run: |
           docker compose up --no-build --wait --wait-timeout 600
       - name: Verify serving and monitoring
         run: |

@@ -2,6 +2,8 @@
   "format_version": 1,
   "filename": "parkinsons_updrs.csv",
   "source": "https://archive.ics.uci.edu/dataset/189/parkinsons+telemonitoring",
+  "download_url": "https://archive.ics.uci.edu/static/public/189/parkinsons+telemonitoring.zip",
+  "archive_member": "parkinsons_updrs.data",
   "size": 911261,
   "sha256": "f2c7d5025dec4e92e7feae367a5f7ccf58789a10ac6b54bdf15976c599f9dd39",
   "dvc_md5": "4f97310e2c9fbeedb72e8a37822fee45"

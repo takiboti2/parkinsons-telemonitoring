@@ -29,6 +29,10 @@ from parkinsons_ml.tracking import (
 LOGGER = logging.getLogger(__name__)
 
 
+class DeploymentError(ValueError):
+    """Operator-safe diagnostic containing only a fixed, authored message."""
+
+
 def bundle_metadata(root: Path) -> dict[str, object]:
     metadata = json.loads((root / "documents/data-bundle.json").read_bytes())
     dvc_path = root / "dataset.dvc"
@@ -42,42 +46,45 @@ def bundle_metadata(root: Path) -> dict[str, object]:
         or metadata.get("size") != tracked["size"]
         or metadata.get("dvc_md5") != tracked["md5"]
     ):
-        raise ValueError("Bundle pin disagrees with DVC metadata")
+        raise DeploymentError("Bundle pin disagrees with DVC metadata")
     return metadata
 
 
 def verified_data(root: Path, path: Path) -> bytes:
     expected = bundle_metadata(root)
     if path.is_symlink() or not path.is_file() or path.stat().st_size != expected["size"]:
-        raise ValueError("Raw dataset is missing, linked, or has an unexpected size")
+        raise DeploymentError("Raw dataset is missing, linked, or has an unexpected size")
     payload = path.read_bytes()
     if (
         hashlib.sha256(payload).hexdigest() != expected["sha256"]
         or hashlib.md5(payload, usedforsecurity=False).hexdigest() != expected["dvc_md5"]
     ):
-        raise ValueError("Raw dataset checksum does not match the Git/DVC pin")
+        raise DeploymentError("Raw dataset checksum does not match the Git/DVC pin")
     return payload
 
 
 def create_bundle(root: Path, destination: Path) -> None:
     payload = verified_data(root, root / "data/raw/parkinsons_updrs.csv")
     metadata = bundle_metadata(root)
-    destination.mkdir(parents=True, exist_ok=False)
+    try:
+        destination.mkdir(parents=True, exist_ok=False)
+    except FileExistsError:
+        raise DeploymentError("Bundle destination already exists; choose a new directory") from None
     (destination / "parkinsons_updrs.csv").write_bytes(payload)
     (destination / "manifest.json").write_text(json.dumps(metadata, sort_keys=True) + "\n")
 
 
 def install_bundle(root: Path, bundle: Path) -> None:
-    expected = bundle_metadata(root)
-    if set(path.name for path in bundle.iterdir()) != {"manifest.json", "parkinsons_updrs.csv"}:
-        raise ValueError("Bundle must contain exactly the raw CSV and manifest.json")
-    if (bundle / "manifest.json").is_symlink() or json.loads((bundle / "manifest.json").read_bytes()) != expected:
-        raise ValueError("Bundle manifest differs from the Git-tracked expectation")
-    payload = verified_data(root, bundle / "parkinsons_updrs.csv")
     raw = root / "data/raw/parkinsons_updrs.csv"
     if raw.exists() or raw.is_symlink():
         verified_data(root, raw)
         return
+    expected = bundle_metadata(root)
+    if set(path.name for path in bundle.iterdir()) != {"manifest.json", "parkinsons_updrs.csv"}:
+        raise DeploymentError("Bundle must contain exactly the raw CSV and manifest.json")
+    if (bundle / "manifest.json").is_symlink() or json.loads((bundle / "manifest.json").read_bytes()) != expected:
+        raise DeploymentError("Bundle manifest differs from the Git-tracked expectation")
+    payload = verified_data(root, bundle / "parkinsons_updrs.csv")
     raw.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive creation never overwrites an existing dataset, including on races.
     with raw.open("xb") as output:
@@ -96,34 +103,46 @@ def wait_for_mlflow(client: MlflowClient, attempts: int = 6) -> None:
 
 
 def bootstrap(root: Path, bundle: Path, uri: str) -> None:
+    LOGGER.info("Validating tracking transport and source provenance")
     validate_tracking_uri(uri)
     validate_repository()
+    LOGGER.info("Verifying persistent raw data or installing the offline bundle")
     install_bundle(root, bundle)
+    LOGGER.info("Validating preparation and training configuration")
     parameters = yaml.load((root / "params.yaml").read_text(), Loader=UniqueKeyLoader)
     if not isinstance(parameters, dict) or not isinstance(parameters.get("prepare"), dict):
-        raise ValueError("Bootstrap requires preparation parameters")
+        raise DeploymentError("Bootstrap requires preparation parameters")
     preparation = PrepareConfig(**parameters["prepare"])
     config = training_config(parameters.get("train"))
     if not config.promotion.enabled:
-        raise ValueError("Bootstrap requires champion promotion to be enabled")
+        raise DeploymentError("Bootstrap requires champion promotion to be enabled")
+    LOGGER.info("Preparing or validating persistent development data")
     processed = root / "data/processed"
     if not processed.exists() or not any(processed.iterdir()):
         prepare(root / "data/raw/parkinsons_updrs.csv", processed, preparation, root / "data/prepare-failure.json")
     snapshot = load_training_snapshot(processed)  # never opens or hashes test.csv
     manifest = json.loads(snapshot.artifacts["manifest.json"])
     if manifest["raw_sha256"] != bundle_metadata(root)["sha256"] or manifest["parameters"] != asdict(preparation):
-        raise ValueError("Existing processed data differs from the pinned bootstrap configuration")
+        raise DeploymentError("Existing processed data differs from the pinned bootstrap configuration")
+    LOGGER.info("Waiting for MLflow and reconciling champion state")
     with tracking_context(uri) as client:
         wait_for_mlflow(client)
         with promotion_lock(PROMOTION_LOCK):
             reconcile(client, config.promotion.registered_model_name)
             existing = champion_version(client, config.promotion.registered_model_name)
         if existing is not None:
-            with load_pipeline(resolve_champion(client, config.promotion.registered_model_name)):
+            version = resolve_champion(client, config.promotion.registered_model_name)
+            if (
+                version.tags.get("dataset_id") != snapshot.dataset_id
+                or version.tags.get("split_id") != snapshot.split_id
+            ):
+                raise DeploymentError("Existing champion dataset/split identity differs from prepared development data")
+            with load_pipeline(version):
                 return
+    LOGGER.info("Training an initial champion")
     result = run_experiment(config, processed, uri)
     if result.promotion is None or result.promotion.decision not in {"promoted", "retained"}:
-        raise RuntimeError("Bootstrap did not establish a confirmed champion")
+        raise DeploymentError("Bootstrap did not establish a confirmed champion")
     with tracking_context(uri) as client:
         with load_pipeline(resolve_champion(client, config.promotion.registered_model_name)):
             pass
@@ -140,6 +159,9 @@ def main() -> None:
             create_bundle(ROOT, args.directory)
         else:
             bootstrap(ROOT, args.directory, os.environ["MLFLOW_TRACKING_URI"])
+    except DeploymentError as error:
+        LOGGER.error("Deployment operation failed: %s", error)
+        raise SystemExit(1) from None
     except Exception as error:
         LOGGER.error("Deployment operation failed (%s)", type(error).__name__)
         raise SystemExit(1) from None

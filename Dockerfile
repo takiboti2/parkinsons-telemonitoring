@@ -5,6 +5,7 @@ COPY --from=uv /uv /usr/local/bin/uv
 WORKDIR /app
 ENV UV_PYTHON_DOWNLOADS=never UV_LINK_MODE=copy
 COPY pyproject.toml uv.lock requirements.txt README.md params.yaml dvc.yaml dvc.lock ./
+COPY Dockerfile .dockerignore compose.yaml ./
 COPY src ./src
 COPY documents/data-bundle.json ./documents/data-bundle.json
 COPY data/raw/parkinsons_updrs.csv.dvc ./dataset.dvc

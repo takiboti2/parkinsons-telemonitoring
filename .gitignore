@@ -7,6 +7,7 @@ wheels/
 *.egg-info
 .env
 /data-bundle/
+/build-provenance.json
 # MLflow metadata and artifacts are persisted locally, not committed or DVC-tracked.
 /storage/mlflow/
 # Virtual environments

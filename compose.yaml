@@ -1,9 +1,9 @@
 x-runtime: &runtime
-  image: parkinsons-telemonitoring:${SOURCE_REVISION:?Set SOURCE_REVISION to the clean commit SHA}
+  image: parkinsons-telemonitoring:${SOURCE_REVISION:-local}
   build:
     context: .
     args:
-      SOURCE_REVISION: ${SOURCE_REVISION}
+      SOURCE_REVISION: ${SOURCE_REVISION:-}
   init: true
   read_only: true
   tmpfs:
@@ -27,6 +27,7 @@ x-client: &client
 services:
   mlflow:
     <<: *runtime
+    restart: unless-stopped
     environment:
       MLFLOW_DISABLE_TELEMETRY: "true"
     command:
@@ -71,7 +72,7 @@ services:
       - app-data:/app/data
       - promotion-lock:/app/storage/mlflow
       - type: bind
-        source: ${DATA_BUNDLE_DIR:?Set DATA_BUNDLE_DIR to a checksum-verified bundle directory}
+        source: ${DATA_BUNDLE_DIR:-./data-bundle}
         target: /bundle
         read_only: true
         bind:
@@ -79,9 +80,10 @@ services:
 
   api:
     <<: *runtime
+    restart: unless-stopped
     environment:
       <<: *client
-      PARKINSONS_API_KEY: ${PARKINSONS_API_KEY:?Set a private API key of at least 32 characters}
+      PARKINSONS_API_KEY: ${PARKINSONS_API_KEY:-}
     depends_on:
       bootstrap:
         condition: service_completed_successfully
@@ -102,6 +104,7 @@ services:
 
   dashboard:
     <<: *runtime
+    restart: unless-stopped
     environment: *client
     depends_on:
       bootstrap:

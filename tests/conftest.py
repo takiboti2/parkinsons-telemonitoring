@@ -33,9 +33,20 @@ def prepared_directory(tmp_path: Path) -> Path:
 def image_root(tmp_path: Path, prepared_directory: Path) -> Path:
     root = tmp_path / "image"
     (root / "src/parkinsons_ml").mkdir(parents=True)
-    for source in (tracking.ROOT / "src/parkinsons_ml").glob("*.py"):
-        (root / "src/parkinsons_ml" / source.name).write_bytes(source.read_bytes())
-    for name in ("uv.lock", "pyproject.toml", "requirements.txt", "dvc.yaml", "dvc.lock"):
+    for source in (tracking.ROOT / "src/parkinsons_ml").rglob("*.py"):
+        destination = root / source.relative_to(tracking.ROOT)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+    for name in (
+        "uv.lock",
+        "pyproject.toml",
+        "requirements.txt",
+        "dvc.yaml",
+        "dvc.lock",
+        "Dockerfile",
+        ".dockerignore",
+        "compose.yaml",
+    ):
         (root / name).write_bytes((tracking.ROOT / name).read_bytes())
     (root / "params.yaml").write_text(
         yaml.safe_dump(
